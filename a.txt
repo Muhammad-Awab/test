@@ -1,12 +1,29 @@
 python -c "
-import glob, json, os
+import glob, json, os, subprocess
 files = glob.glob(os.path.expanduser('~/.aws/sso/cache/*.json'))
+token = None
 for f in files:
     try:
         d = json.load(open(f))
         if 'accessToken' in d:
-            print('Token found:', f)
-            print(d['accessToken'][:20], '...')
+            token = d['accessToken']
+            break
     except:
         pass
+
+if not token:
+    print('NO TOKEN — run: aws sso login --profile waf-search1 --no-verify-ssl')
+else:
+    r = subprocess.run([
+        'aws', 'sso', 'list-accounts',
+        '--access-token', token,
+        '--region', 'us-east-1',
+        '--no-verify-ssl',
+        '--output', 'json'
+    ], capture_output=True, text=True)
+    d = json.loads(r.stdout)
+    accounts = d.get('accountList', [])
+    print(f'Found {len(accounts)} accounts')
+    for a in accounts[:5]:
+        print(f'  {a[\"accountName\"]} ({a[\"accountId\"]})')
 "
