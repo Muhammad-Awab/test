@@ -1,189 +1,273 @@
-import subprocess
-import json
+cat > waf_app.py << 'EOF'
+import boto3
 import socket
 import csv
+import os
+import ssl
 from datetime import datetime
 
+# ── SSL FIX for corporate network ──
+os.environ["PYTHONHTTPSVERIFY"] = "0"
+ssl._create_default_https_context = ssl._create_unverified_context
+
 # ── CONFIG ──
-SSO_START_URL = "https://truist.awsapps.com/start"
-SSO_REGION = "us-east-1"
-ROLE_NAME = "G-ROLE-AWS-ENT-WAFADMIN-RO"
-REGIONS = ["us-east-1", "us-east-2", "us-west-2"]
+PROFILE  = "waf-search1"
+REGIONS  = ["us-east-1", "us-east-2", "us-west-2"]
+OUT_FILE = f"waf_report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
 HOSTNAMES_FILE = "hostnames.txt"
-OUTPUT_FILE = f"waf_coverage_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
 
-def run_cmd(cmd):
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30
-        )
-        return json.loads(result.stdout) if result.stdout else {}
-    except:
-        return {}
+# ── FIELDNAMES — always consistent ──
+FIELDS = [
+    "Hostname", "IP", "Resource_Type", "Resource_Name",
+    "Resource_ARN", "WAF_Protected", "WAF_Name",
+    "WAF_Region", "Notes"
+]
 
-# ── STEP 1: Get SSO access token from cache ──
-def get_sso_token():
-    import glob, os
-    cache_files = glob.glob(
-        os.path.expanduser("~/.aws/sso/cache/*.json")
-    )
-    for f in cache_files:
-        try:
-            with open(f) as fh:
-                data = json.load(fh)
-                if "accessToken" in data:
-                    return data["accessToken"]
-        except:
-            continue
-    return None
-
-# ── STEP 2: Get ALL 358 account IDs from SSO ──
-def get_all_accounts(token):
-    print("Fetching all accounts from SSO...")
-    accounts = []
-    next_token = None
-
-    while True:
-        cmd = [
-            "aws", "sso", "list-accounts",
-            "--access-token", token,
-            "--region", SSO_REGION,
-            "--no-verify-ssl",
-            "--output", "json"
-        ]
-        if next_token:
-            cmd += ["--next-token", next_token]
-
-        data = run_cmd(cmd)
-        accounts.extend(data.get("accountList", []))
-        next_token = data.get("nextToken")
-        if not next_token:
-            break
-
-    print(f"Found {len(accounts)} accounts")
-    return accounts
-
-# ── STEP 3: Get temp credentials for each account ──
-def get_account_creds(token, account_id):
-    data = run_cmd([
-        "aws", "sso", "get-role-credentials",
-        "--account-id", account_id,
-        "--role-name", ROLE_NAME,
-        "--access-token", token,
-        "--region", SSO_REGION,
-        "--no-verify-ssl",
-        "--output", "json"
-    ])
-    return data.get("roleCredentials")
-
-# ── STEP 4: Run AWS command with temp creds ──
-def run_aws(cmd, creds):
-    env_creds = {
-        "AWS_ACCESS_KEY_ID": creds["accessKeyId"],
-        "AWS_SECRET_ACCESS_KEY": creds["secretAccessKey"],
-        "AWS_SESSION_TOKEN": creds["sessionToken"],
-        "AWS_DEFAULT_REGION": "us-east-1"
+def empty_result(hostname, ip="", notes="Not found"):
+    return {
+        "Hostname":      hostname,
+        "IP":            ip,
+        "Resource_Type": "Not Found",
+        "Resource_Name": "",
+        "Resource_ARN":  "",
+        "WAF_Protected": "NO",
+        "WAF_Name":      "",
+        "WAF_Region":    "",
+        "Notes":         notes
     }
-    import os
-    env = {**os.environ, **env_creds}
-    try:
-        result = subprocess.run(
-            cmd + ["--no-verify-ssl"],
-            capture_output=True, text=True,
-            timeout=30, env=env
-        )
-        return json.loads(result.stdout) if result.stdout else {}
-    except:
-        return {}
 
-# ── STEP 5: Get WAF associations for one account ──
-def get_waf_associations(creds):
-    associations = {}
-    for region in REGIONS:
-        data = run_aws([
-            "aws", "wafv2", "list-web-acls",
-            "--scope", "REGIONAL",
-            "--region", region,
-            "--output", "json"
-        ], creds)
-        for acl in data.get("WebACLs", []):
-            arn = acl["ARN"]
-            resources = run_aws([
-                "aws", "wafv2", "list-resources-for-web-acl",
-                "--web-acl-arn", arn,
-                "--region", region,
-                "--output", "json"
-            ], creds)
-            for r in resources.get("ResourceArns", []):
-                associations[r] = {
-                    "WebACLName": acl["Name"],
-                    "WebACLArn": arn,
-                    "Region": region
-                }
-    # CloudFront scope
-    data = run_aws([
-        "aws", "wafv2", "list-web-acls",
-        "--scope", "CLOUDFRONT",
-        "--region", "us-east-1",
-        "--output", "json"
-    ], creds)
-    for acl in data.get("WebACLs", []):
-        arn = acl["ARN"]
-        resources = run_aws([
-            "aws", "wafv2", "list-resources-for-web-acl",
-            "--web-acl-arn", arn,
-            "--region", "us-east-1",
-            "--output", "json"
-        ], creds)
-        for r in resources.get("ResourceArns", []):
-            associations[r] = {
-                "WebACLName": acl["Name"],
-                "WebACLArn": arn,
-                "Region": "CLOUDFRONT"
-            }
-    return associations
-
-# ── STEP 6: Get CloudFront + ALB for one account ──
-def get_cf_and_alb(creds):
-    cf_map = {}
-    alb_map = {}
-
-    # CloudFront
-    data = run_aws([
-        "aws", "cloudfront", "list-distributions",
-        "--output", "json"
-    ], creds)
-    for dist in data.get("DistributionList", {}).get("Items", []):
-        arn = dist.get("ARN", "")
-        for alias in dist.get("Aliases", {}).get("Items", []):
-            cf_map[alias.lower()] = arn
-        cf_map[dist.get("DomainName", "").lower()] = arn
-
-    # ALBs
-    for region in REGIONS:
-        data = run_aws([
-            "aws", "elbv2", "describe-load-balancers",
-            "--region", region,
-            "--output", "json"
-        ], creds)
-        for lb in data.get("LoadBalancers", []):
-            alb_map[lb.get("DNSName", "").lower()] = {
-                "arn": lb["LoadBalancerArn"],
-                "region": region
-            }
-
-    return cf_map, alb_map
-
-# ── STEP 7: DNS lookup ──
 def dns_lookup(hostname):
     try:
         return socket.gethostbyname(hostname)
     except:
         return "DNS_FAILED"
 
-# ── MAIN ──
+def get_sso_token():
+    import glob
+    cache_files = glob.glob(
+        os.path.expanduser("~/.aws/sso/cache/*.json")
+    )
+    import json
+    for f in cache_files:
+        try:
+            with open(f) as fh:
+                data = json.load(fh)
+                if "accessToken" in data:
+                    print(f"  SSO token found: {f}")
+                    return data["accessToken"]
+        except:
+            continue
+    return None
+
+def get_all_accounts(token):
+    print("Fetching all accounts from SSO...")
+    import subprocess, json
+    accounts = []
+    next_token = None
+    while True:
+        cmd = [
+            "aws", "sso", "list-accounts",
+            "--access-token", token,
+            "--region", "us-east-1",
+            "--no-verify-ssl",
+            "--output", "json"
+        ]
+        if next_token:
+            cmd += ["--next-token", next_token]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True,
+                text=True, timeout=30
+            )
+            data = json.loads(result.stdout)
+            accounts.extend(data.get("accountList", []))
+            next_token = data.get("nextToken")
+            if not next_token:
+                break
+        except:
+            break
+    print(f"  Found {len(accounts)} accounts")
+    return accounts
+
+def get_account_creds(token, account_id, role_name):
+    import subprocess, json
+    cmd = [
+        "aws", "sso", "get-role-credentials",
+        "--account-id", account_id,
+        "--role-name", role_name,
+        "--access-token", token,
+        "--region", "us-east-1",
+        "--no-verify-ssl",
+        "--output", "json"
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True,
+            text=True, timeout=30
+        )
+        data = json.loads(result.stdout)
+        return data.get("roleCredentials")
+    except:
+        return None
+
+def get_session_from_creds(creds):
+    return boto3.Session(
+        aws_access_key_id     = creds["accessKeyId"],
+        aws_secret_access_key = creds["secretAccessKey"],
+        aws_session_token     = creds["sessionToken"]
+    )
+
+def get_waf_associations(session):
+    associations = {}
+    for region in REGIONS:
+        try:
+            waf = session.client(
+                "wafv2", region_name=region,
+                verify=False
+            )
+            resp = waf.list_web_acls(
+                Scope="REGIONAL", Limit=100
+            )
+            for acl in resp.get("WebACLs", []):
+                try:
+                    res = waf.list_resources_for_web_acl(
+                        WebACLArn=acl["ARN"]
+                    )
+                    for r in res.get("ResourceArns", []):
+                        associations[r] = {
+                            "WAF_Name":   acl["Name"],
+                            "WAF_Region": region
+                        }
+                except:
+                    pass
+        except:
+            pass
+
+    # CloudFront
+    try:
+        waf = session.client(
+            "wafv2", region_name="us-east-1",
+            verify=False
+        )
+        resp = waf.list_web_acls(
+            Scope="CLOUDFRONT", Limit=100
+        )
+        for acl in resp.get("WebACLs", []):
+            try:
+                res = waf.list_resources_for_web_acl(
+                    WebACLArn=acl["ARN"]
+                )
+                for r in res.get("ResourceArns", []):
+                    associations[r] = {
+                        "WAF_Name":   acl["Name"],
+                        "WAF_Region": "CLOUDFRONT"
+                    }
+            except:
+                pass
+    except:
+        pass
+    return associations
+
+def get_cloudfront_map(session):
+    cf_map = {}
+    try:
+        cf   = session.client("cloudfront", verify=False)
+        resp = cf.list_distributions()
+        for dist in resp.get(
+            "DistributionList", {}
+        ).get("Items", []):
+            arn = dist.get("ARN", "")
+            cf_map[dist.get("DomainName","").lower()] = arn
+            for alias in dist.get(
+                "Aliases", {}
+            ).get("Items", []):
+                cf_map[alias.lower()] = arn
+    except:
+        pass
+    return cf_map
+
+def get_alb_map(session):
+    alb_map = {}
+    for region in REGIONS:
+        try:
+            elb  = session.client(
+                "elbv2", region_name=region,
+                verify=False
+            )
+            resp = elb.describe_load_balancers()
+            for lb in resp.get("LoadBalancers", []):
+                dns = lb.get("DNSName","").lower()
+                alb_map[dns] = {
+                    "arn":    lb["LoadBalancerArn"],
+                    "region": region,
+                    "name":   lb.get("LoadBalancerName","")
+                }
+        except:
+            pass
+    return alb_map
+
+def check_hostname(hostname, cf_map, alb_map, waf_assoc):
+    h  = hostname.lower()
+    ip = dns_lookup(hostname)
+    r  = empty_result(hostname, ip)
+
+    # CloudFront
+    if h in cf_map:
+        arn = cf_map[h]
+        r.update({
+            "Resource_Type": "CloudFront",
+            "Resource_ARN":  arn,
+            "Notes":         ""
+        })
+        if arn in waf_assoc:
+            w = waf_assoc[arn]
+            r.update({
+                "WAF_Protected": "YES",
+                "WAF_Name":      w["WAF_Name"],
+                "WAF_Region":    w["WAF_Region"]
+            })
+        else:
+            r["Notes"] = "CloudFront — NO WAF"
+        return r
+
+    # ALB
+    for alb_dns, info in alb_map.items():
+        if alb_dns in h or h in alb_dns:
+            r.update({
+                "Resource_Type": "ALB",
+                "Resource_Name": info["name"],
+                "Resource_ARN":  info["arn"],
+                "Notes":         ""
+            })
+            if info["arn"] in waf_assoc:
+                w = waf_assoc[info["arn"]]
+                r.update({
+                    "WAF_Protected": "YES",
+                    "WAF_Name":      w["WAF_Name"],
+                    "WAF_Region":    w["WAF_Region"]
+                })
+            else:
+                r["Notes"] = "ALB — NO WAF"
+            return r
+
+    # Hints
+    if "execute-api" in h:
+        r.update({
+            "Resource_Type": "API Gateway",
+            "Notes": "API Gateway — check WAF manually"
+        })
+    elif "cloudfront.net" in str(ip):
+        r.update({
+            "Resource_Type": "CloudFront (by IP)",
+            "Notes": "Resolves to CF — not in this account"
+        })
+    return r
+
+# ══════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════
 print("=" * 60)
-print("WAF Coverage — All 358 Accounts")
+print("WAF Coverage — All Truist Accounts")
 print("=" * 60)
 
 # Load hostnames
@@ -195,115 +279,80 @@ print(f"Loaded {len(hostnames)} hostnames\n")
 token = get_sso_token()
 if not token:
     print("ERROR: No SSO token found!")
-    print("Run first: aws sso login --profile waf-search1 --no-verify-ssl")
+    print("Run: aws sso login --profile waf-search1 --no-verify-ssl")
     exit(1)
-print("SSO token found OK\n")
+print("SSO token OK\n")
 
 # Get all accounts
 accounts = get_all_accounts(token)
+if not accounts:
+    print("ERROR: No accounts found!")
+    exit(1)
 
-# DNS resolve all hostnames once
-print("Resolving DNS for all hostnames...")
-hostname_ips = {h: dns_lookup(h) for h in hostnames}
+# Get available role from first working account
+ROLE_NAME = "G-ROLE-AWS-ENT-WAFADMIN-RO"
 
-# Master results dict
-results = {h: {
-    "Hostname": h,
-    "IP": hostname_ips[h],
-    "Account_ID": "",
-    "Account_Name": "",
-    "Resource_Type": "Not Found",
-    "Resource_ARN": "",
-    "WAF_Protected": "NO",
-    "WAF_Name": "",
-    "WAF_Region": "",
-    "Notes": "Not found in any account"
-} for h in hostnames}
+# Master results — pre-populate all hostnames
+results = {h: empty_result(h, dns_lookup(h)) for h in hostnames}
 
-# Loop every account
+# ── Loop every account ──
 for i, account in enumerate(accounts):
-    account_id = account["accountId"]
-    account_name = account.get("accountName", "")
-    print(f"\n[{i+1}/{len(accounts)}] Checking: {account_name} ({account_id})")
+    acc_id   = account["accountId"]
+    acc_name = account.get("accountName", "unknown")
+    print(f"[{i+1}/{len(accounts)}] {acc_name} ({acc_id})")
 
-    # Get creds
-    creds = get_account_creds(token, account_id)
+    creds = get_account_creds(token, acc_id, ROLE_NAME)
     if not creds:
-        print(f"  Skipping — no credentials available")
+        print(f"  No creds — skipping")
         continue
 
-    # Get WAF associations, CF, ALB
-    waf_assoc = get_waf_associations(creds)
-    cf_map, alb_map = get_cf_and_alb(creds)
+    session   = get_session_from_creds(creds)
+    waf_assoc = get_waf_associations(session)
+    cf_map    = get_cloudfront_map(session)
+    alb_map   = get_alb_map(session)
 
     if not waf_assoc and not cf_map and not alb_map:
         continue
 
-    # Check each hostname against this account
     for hostname in hostnames:
-        h_lower = hostname.lower()
-
-        # Already found with WAF — skip
+        # Skip already confirmed protected
         if results[hostname]["WAF_Protected"] == "YES":
             continue
 
-        # Check CloudFront
-        if h_lower in cf_map:
-            arn = cf_map[h_lower]
-            results[hostname].update({
-                "Account_ID": account_id,
-                "Account_Name": account_name,
-                "Resource_Type": "CloudFront",
-                "Resource_ARN": arn,
-                "Notes": ""
-            })
-            if arn in waf_assoc:
-                w = waf_assoc[arn]
-                results[hostname].update({
-                    "WAF_Protected": "YES",
-                    "WAF_Name": w["WebACLName"],
-                    "WAF_Region": w["Region"]
-                })
-                print(f"  FOUND+WAF: {hostname}")
-            else:
-                results[hostname]["Notes"] = "CloudFront found — NO WAF"
-                print(f"  FOUND no WAF: {hostname}")
+        r = check_hostname(hostname, cf_map, alb_map, waf_assoc)
 
-        # Check ALB
-        for alb_dns, alb_info in alb_map.items():
-            if alb_dns in h_lower or h_lower in alb_dns:
-                arn = alb_info["arn"]
-                results[hostname].update({
-                    "Account_ID": account_id,
-                    "Account_Name": account_name,
-                    "Resource_Type": "ALB",
-                    "Resource_ARN": arn,
-                    "Notes": ""
-                })
-                if arn in waf_assoc:
-                    w = waf_assoc[arn]
-                    results[hostname].update({
-                        "WAF_Protected": "YES",
-                        "WAF_Name": w["WebACLName"],
-                        "WAF_Region": w["Region"]
-                    })
-                    print(f"  FOUND+WAF: {hostname}")
-                else:
-                    results[hostname]["Notes"] = "ALB found — NO WAF"
+        if r["Resource_Type"] != "Not Found":
+            r["Notes"] = (
+                r.get("Notes","") +
+                f" | Account: {acc_name} ({acc_id})"
+            ).strip(" |")
+            results[hostname] = r
 
-# Write CSV
+            status = "YES" if r["WAF_Protected"] == "YES" else "NO"
+            print(f"  {hostname} → WAF:{status} | {r['Resource_Type']}")
+
+# ── Write CSV ──
 rows = list(results.values())
-with open(OUTPUT_FILE, "w", newline="") as f:
-    writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-    writer.writeheader()
-    writer.writerows(rows)
 
-# Summary
-protected = sum(1 for r in rows if r["WAF_Protected"] == "YES")
+# Safety check — ensure all rows have correct fields
+clean_rows = []
+for row in rows:
+    clean = {f: row.get(f, "") for f in FIELDS}
+    clean_rows.append(clean)
+
+with open(OUT_FILE, "w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=FIELDS)
+    writer.writeheader()
+    writer.writerows(clean_rows)
+
+# ── Summary ──
+protected = sum(1 for r in clean_rows if r["WAF_Protected"] == "YES")
 print("\n" + "=" * 60)
-print(f"SUMMARY")
-print(f"  Total hostnames : {len(rows)}")
-print(f"  WAF protected   : {protected}")
-print(f"  NOT protected   : {len(rows) - protected}")
-print(f"  Report saved to : {OUTPUT_FILE}")
+print("FINAL SUMMARY")
+print(f"  Accounts scanned : {len(accounts)}")
+print(f"  Hostnames checked: {len(clean_rows)}")
+print(f"  WAF protected    : {protected}")
+print(f"  NOT protected    : {len(clean_rows) - protected}")
+print(f"  Report saved     : {OUT_FILE}")
 print("=" * 60)
+EOF
