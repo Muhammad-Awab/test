@@ -1,2 +1,1 @@
-rename $env:USERPROFILE\.aws\credentials credentials.bak
-    
+Rename-Item "$env:USERPROFILE\.aws\credentials" "credentials.bak"
