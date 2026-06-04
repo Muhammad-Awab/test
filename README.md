@@ -1,1 +1,9 @@
-# test
+cat > hostnames.txt << 'EOF'
+api.oneviewmessaging.truist.com
+api.oneviewmessaginglab.truist.com
+api.oneviewmessagingqa.truist.com
+api.truistassist.truist.com
+api.truistassistdev.truist.com
+apiaa.truistassistdev.truist.com
+apiaa.truistassistlab.truist.com
+EOF
