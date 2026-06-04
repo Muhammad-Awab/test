@@ -1,6 +1,8 @@
-# Step 1 - create the test file
-@"
-import glob, json, os, subprocess
+import glob
+import json
+import os
+import subprocess
+
 files = glob.glob(os.path.expanduser('~/.aws/sso/cache/*.json'))
 token = None
 for f in files:
@@ -17,21 +19,24 @@ if not token:
     print('Run: aws sso login --profile waf-search1 --no-verify-ssl')
 else:
     print('Token found OK')
-    r = subprocess.run([
-        'aws', 'sso', 'list-accounts',
-        '--access-token', token,
-        '--region', 'us-east-1',
-        '--no-verify-ssl',
-        '--output', 'json'
-    ], capture_output=True, text=True)
+    r = subprocess.run(
+        ['aws', 'sso', 'list-accounts',
+         '--access-token', token,
+         '--region', 'us-east-1',
+         '--no-verify-ssl',
+         '--output', 'json'],
+        capture_output=True,
+        text=True
+    )
     try:
         d = json.loads(r.stdout)
         accounts = d.get('accountList', [])
-        print(f'Found {len(accounts)} accounts')
+        print('Found ' + str(len(accounts)) + ' accounts')
         for a in accounts[:5]:
-            print(f'  {a["accountName"]} ({a["accountId"]})')
-    except:
-        print('Error parsing response:')
+            name = a.get('accountName', '')
+            aid  = a.get('accountId', '')
+            print('  ' + name + ' (' + aid + ')')
+    except Exception as e:
+        print('Error: ' + str(e))
         print(r.stdout[:200])
         print(r.stderr[:200])
-"@ | Out-File -FilePath test_token.py -Encoding utf8
