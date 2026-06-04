@@ -1,7 +1,1 @@
-api.oneviewmessaging.truist.com
-api.oneviewmessaginglab.truist.com
-api.oneviewmessagingqa.truist.com
-api.truistassist.truist.com
-api.truistassistdev.truist.com
-apiaa.truistassistdev.truist.com
-apiaa.truistassistlab.truist.com
+aws sso list-accounts --access-token (for /f %f in ('dir /b %USERPROFILE%\.aws\sso\cache\*.json') do @python -c "import json; d=json.load(open(r'%USERPROFILE%\.aws\sso\cache\%f')); print(d.get('accessToken',''))" 2^>nul) --region us-east-1 --no-verify-ssl
