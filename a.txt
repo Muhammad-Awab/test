@@ -1,1 +1,12 @@
-aws sso list-accounts --access-token (for /f %f in ('dir /b %USERPROFILE%\.aws\sso\cache\*.json') do @python -c "import json; d=json.load(open(r'%USERPROFILE%\.aws\sso\cache\%f')); print(d.get('accessToken',''))" 2^>nul) --region us-east-1 --no-verify-ssl
+python -c "
+import glob, json, os
+files = glob.glob(os.path.expanduser('~/.aws/sso/cache/*.json'))
+for f in files:
+    try:
+        d = json.load(open(f))
+        if 'accessToken' in d:
+            print('Token found:', f)
+            print(d['accessToken'][:20], '...')
+    except:
+        pass
+"
