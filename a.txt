@@ -1,2 +1,3 @@
+Remove-Item "$env:USERPROFILE\.aws\sso\cache\*" -Force
+aws sso login --profile waf-search1 --no-verify-ssl
 $env:AWS_CA_BUNDLE = ""
-$env:PYTHONHTTPSVERIFY = "0"
