@@ -13,11 +13,14 @@ os.environ["PYTHONHTTPSVERIFY"] = "0"
 ssl._create_default_https_context = ssl._create_unverified_context
 
 # CONFIG
-REGIONS   = ["us-east-1", "us-east-2", "us-west-2",
-             "us-west-1", "eu-west-1", "ap-southeast-1"]
-OUT_FILE  = "waf_report_" + datetime.now().strftime("%Y%m%d_%H%M") + ".csv"
+REGIONS   = [
+    "us-east-1", "us-east-2", "us-west-1", "us-west-2",
+    "eu-west-1", "ap-southeast-1", "ap-northeast-1"
+]
+OUT_FILE       = "waf_report_" + datetime.now().strftime("%Y%m%d_%H%M") + ".csv"
+DEBUG_FILE     = "waf_debug_"  + datetime.now().strftime("%Y%m%d_%H%M") + ".txt"
 HOSTNAMES_FILE = "hostnames.txt"
-ROLE_NAME = "G-ROLE-AWS-ENT-WAFADMIN-RO"
+ROLE_NAME      = "G-ROLE-AWS-ENT-WAFADMIN-RO"
 
 FIELDS = [
     "Hostname", "IP", "CNAME",
@@ -26,10 +29,14 @@ FIELDS = [
     "Account_ID", "Account_Name", "Notes"
 ]
 
+debug_lines = []
+
+def log(msg):
+    print(msg)
+    debug_lines.append(str(msg))
+
 def empty_result(hostname, ip="", cname=""):
-    result = {}
-    for f in FIELDS:
-        result[f] = ""
+    result = {f: "" for f in FIELDS}
     result["Hostname"]      = hostname
     result["IP"]            = ip
     result["CNAME"]         = cname
@@ -44,60 +51,39 @@ def dns_lookup(hostname):
     except Exception:
         return "DNS_FAILED"
 
-def dns_cname(hostname):
-    try:
-        import dns.resolver
-        answers = dns.resolver.resolve(hostname, "CNAME")
-        return str(answers[0].target).rstrip(".")
-    except Exception:
-        return ""
-
 def get_full_dns_chain(hostname):
-    """
-    Resolve full DNS chain to find underlying AWS resource.
-    Returns (ip, cname) where cname is the final AWS endpoint.
-    """
-    ip    = "DNS_FAILED"
+    ip    = dns_lookup(hostname)
     cname = ""
-    try:
-        results = socket.getaddrinfo(hostname, None)
-        if results:
-            ip = results[0][4][0]
-    except Exception:
-        pass
-
-    # Try to get CNAME via nslookup (works without dnspython)
     try:
         r = subprocess.run(
             ["nslookup", hostname],
             capture_output=True, text=True, timeout=10
         )
-        lines = r.stdout.lower().split("\n")
-        for line in lines:
-            if "canonical name" in line or "aliases" in line:
+        output = r.stdout.lower()
+        for line in output.split("\n"):
+            if "canonical name" in line:
                 parts = line.split("=")
                 if len(parts) > 1:
                     cname = parts[1].strip().rstrip(".")
                     break
-            # Also check for cloudfront/amazonaws patterns in output
-            if "cloudfront.net" in line:
-                cname = "cloudfront"
-                break
-            if "execute-api" in line:
-                cname = "api-gateway"
-                break
-            if "elb.amazonaws.com" in line:
-                cname = line.strip()
-                break
+            if "cloudfront.net" in line and not cname:
+                for part in line.split():
+                    if "cloudfront.net" in part:
+                        cname = part.strip().rstrip(".")
+                        break
+            if "elb.amazonaws.com" in line and not cname:
+                for part in line.split():
+                    if "elb.amazonaws.com" in part:
+                        cname = part.strip().rstrip(".")
+                        break
+            if "execute-api" in line and not cname:
+                cname = "api-gateway-detected"
     except Exception:
         pass
-
     return ip, cname
 
 def get_sso_token():
-    cache_files = glob.glob(
-        os.path.expanduser("~/.aws/sso/cache/*.json")
-    )
+    cache_files = glob.glob(os.path.expanduser("~/.aws/sso/cache/*.json"))
     for f in cache_files:
         try:
             with open(f) as fh:
@@ -110,10 +96,7 @@ def get_sso_token():
 
 def run_cmd(cmd):
     try:
-        r = subprocess.run(
-            cmd, capture_output=True,
-            text=True, timeout=30
-        )
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if r.stdout.strip():
             return json.loads(r.stdout)
         return {}
@@ -121,17 +104,14 @@ def run_cmd(cmd):
         return {}
 
 def get_all_accounts(token):
-    print("Fetching all accounts...")
+    log("Fetching all accounts...")
     accounts = []
     next_tok = None
     while True:
-        cmd = [
-            "aws", "sso", "list-accounts",
-            "--access-token", token,
-            "--region", "us-east-1",
-            "--no-verify-ssl",
-            "--output", "json"
-        ]
+        cmd = ["aws", "sso", "list-accounts",
+               "--access-token", token,
+               "--region", "us-east-1",
+               "--no-verify-ssl", "--output", "json"]
         if next_tok:
             cmd += ["--next-token", next_tok]
         data     = run_cmd(cmd)
@@ -140,19 +120,16 @@ def get_all_accounts(token):
         next_tok = data.get("nextToken")
         if not next_tok:
             break
-    print("  Found " + str(len(accounts)) + " accounts")
+    log("  Found " + str(len(accounts)) + " accounts")
     return accounts
 
 def get_creds(token, account_id):
-    data = run_cmd([
-        "aws", "sso", "get-role-credentials",
-        "--account-id", account_id,
-        "--role-name",  ROLE_NAME,
-        "--access-token", token,
-        "--region", "us-east-1",
-        "--no-verify-ssl",
-        "--output", "json"
-    ])
+    data = run_cmd(["aws", "sso", "get-role-credentials",
+                    "--account-id", account_id,
+                    "--role-name",  ROLE_NAME,
+                    "--access-token", token,
+                    "--region", "us-east-1",
+                    "--no-verify-ssl", "--output", "json"])
     return data.get("roleCredentials")
 
 def make_session(creds):
@@ -162,95 +139,72 @@ def make_session(creds):
         aws_session_token     = creds["sessionToken"]
     )
 
-def get_waf_assoc(session):
-    """Get all WAF WebACL associations in this account."""
+def get_waf_assoc(session, acc_id):
     assoc = {}
     for region in REGIONS:
         try:
             waf  = session.client("wafv2", region_name=region, verify=False)
             resp = waf.list_web_acls(Scope="REGIONAL", Limit=100)
-            for acl in resp.get("WebACLs", []):
+            acls = resp.get("WebACLs", [])
+            if acls:
+                log("    WAF Regional " + region + ": " + str(len(acls)) + " ACLs")
+            for acl in acls:
                 try:
-                    res = waf.list_resources_for_web_acl(
-                        WebACLArn=acl["ARN"]
-                    )
+                    res = waf.list_resources_for_web_acl(WebACLArn=acl["ARN"])
                     for r in res.get("ResourceArns", []):
-                        assoc[r] = {
-                            "WAF_Name":   acl["Name"],
-                            "WAF_Region": region
-                        }
+                        assoc[r] = {"WAF_Name": acl["Name"], "WAF_Region": region}
+                        log("      -> " + acl["Name"] + " protects: " + r)
                 except Exception:
                     pass
         except Exception:
             pass
-
-    # CloudFront WAFs
     try:
-        waf  = session.client(
-            "wafv2", region_name="us-east-1", verify=False
-        )
+        waf  = session.client("wafv2", region_name="us-east-1", verify=False)
         resp = waf.list_web_acls(Scope="CLOUDFRONT", Limit=100)
-        for acl in resp.get("WebACLs", []):
+        acls = resp.get("WebACLs", [])
+        if acls:
+            log("    WAF CloudFront: " + str(len(acls)) + " ACLs in " + acc_id)
+        for acl in acls:
             try:
-                res = waf.list_resources_for_web_acl(
-                    WebACLArn=acl["ARN"]
-                )
+                res = waf.list_resources_for_web_acl(WebACLArn=acl["ARN"])
                 for r in res.get("ResourceArns", []):
-                    assoc[r] = {
-                        "WAF_Name":   acl["Name"],
-                        "WAF_Region": "CLOUDFRONT"
-                    }
+                    assoc[r] = {"WAF_Name": acl["Name"], "WAF_Region": "CLOUDFRONT"}
+                    log("      -> " + acl["Name"] + " protects: " + r)
             except Exception:
                 pass
     except Exception:
         pass
-
     return assoc
 
-def get_cf_map(session):
-    """
-    Get CloudFront distributions with ALL aliases.
-    These catch hostnames like api.truistassist.truist.com
-    that are CNAME'd to CloudFront.
-    """
+def get_cf_map(session, acc_id):
     cf_map = {}
     try:
-        cf   = session.client("cloudfront", verify=False)
-        resp = cf.list_distributions()
-        items = resp.get(
-            "DistributionList", {}
-        ).get("Items", [])
+        cf    = session.client("cloudfront", verify=False)
+        resp  = cf.list_distributions()
+        items = resp.get("DistributionList", {}).get("Items", [])
+        if items:
+            log("    CloudFront: " + str(len(items)) + " distributions in " + acc_id)
         for dist in items:
             arn    = dist.get("ARN", "")
             domain = dist.get("DomainName", "").lower()
-            cf_map[domain] = {
-                "arn":    arn,
-                "name":   domain,
-                "domain": domain
-            }
-            # Map every custom alias
-            for alias in dist.get(
-                "Aliases", {}
-            ).get("Items", []):
-                cf_map[alias.lower()] = {
-                    "arn":    arn,
-                    "name":   alias,
-                    "domain": domain
-                }
+            cf_map[domain] = {"arn": arn, "name": domain, "domain": domain}
+            for alias in dist.get("Aliases", {}).get("Items", []):
+                cf_map[alias.lower()] = {"arn": arn, "name": alias, "domain": domain}
+                log("      CF alias: " + alias)
     except Exception:
         pass
     return cf_map
 
-def get_alb_map(session):
-    """Get all ALBs with their DNS names."""
+def get_alb_map(session, acc_id):
     alb_map = {}
     for region in REGIONS:
         try:
-            elb  = session.client(
-                "elbv2", region_name=region, verify=False
-            )
+            elb  = session.client("elbv2", region_name=region, verify=False)
             resp = elb.describe_load_balancers()
-            for lb in resp.get("LoadBalancers", []):
+            lbs  = resp.get("LoadBalancers", [])
+            if lbs:
+                log("    ALBs in " + region + ": " + str(len(lbs)))
+            for lb in lbs:
                 dns = lb.get("DNSName", "").lower()
                 alb_map[dns] = {
                     "arn":    lb["LoadBalancerArn"],
@@ -262,330 +216,283 @@ def get_alb_map(session):
             pass
     return alb_map
 
-def get_apigw_map(session):
-    """
-    Get all API Gateways.
-    Catches execute-api URLs and custom domain names.
-    """
+def get_apigw_map(session, acc_id):
     apigw_map = {}
     for region in REGIONS:
         try:
-            # REST APIs
-            apigw = session.client(
-                "apigateway", region_name=region, verify=False
-            )
-            resp  = apigw.get_rest_apis(limit=500)
-            for api in resp.get("items", []):
-                api_domain = (
-                    api["id"] +
-                    ".execute-api." +
-                    region +
-                    ".amazonaws.com"
-                )
-                apigw_map[api_domain.lower()] = {
-                    "id":     api["id"],
-                    "name":   api.get("name", ""),
-                    "region": region,
-                    "type":   "REST"
-                }
-
-            # Custom domain names
+            apigw = session.client("apigateway", region_name=region, verify=False)
             try:
                 domains = apigw.get_domain_names(limit=500)
-                for d in domains.get("items", []):
+                doms = domains.get("items", [])
+                if doms:
+                    log("    API GW custom domains in " + region + ": " + str(len(doms)))
+                for d in doms:
                     dn = d.get("domainName", "").lower()
-                    apigw_map[dn] = {
-                        "id":     dn,
-                        "name":   dn,
-                        "region": region,
-                        "type":   "Custom Domain"
+                    apigw_map[dn] = {"id": dn, "name": dn, "region": region, "type": "Custom Domain"}
+                    log("      APIGW domain: " + dn)
+            except Exception:
+                pass
+            try:
+                apis = apigw.get_rest_apis(limit=500)
+                for api in apis.get("items", []):
+                    api_domain = api["id"] + ".execute-api." + region + ".amazonaws.com"
+                    apigw_map[api_domain.lower()] = {
+                        "id": api["id"], "name": api.get("name", ""),
+                        "region": region, "type": "REST"
                     }
             except Exception:
                 pass
-
         except Exception:
             pass
-
         try:
-            # HTTP APIs (API GW v2)
-            apigw2 = session.client(
-                "apigatewayv2", region_name=region, verify=False
-            )
-            resp   = apigw2.get_apis()
-            for api in resp.get("Items", []):
-                api_domain = (
-                    api["ApiId"] +
-                    ".execute-api." +
-                    region +
-                    ".amazonaws.com"
-                )
-                apigw_map[api_domain.lower()] = {
-                    "id":     api["ApiId"],
-                    "name":   api.get("Name", ""),
-                    "region": region,
-                    "type":   "HTTP"
-                }
-
-            # Custom domain names v2
+            apigw2 = session.client("apigatewayv2", region_name=region, verify=False)
             try:
                 domains = apigw2.get_domain_names()
-                for d in domains.get("Items", []):
+                doms = domains.get("Items", [])
+                if doms:
+                    log("    API GWv2 custom domains in " + region + ": " + str(len(doms)))
+                for d in doms:
                     dn = d.get("DomainName", "").lower()
-                    apigw_map[dn] = {
-                        "id":     dn,
-                        "name":   dn,
-                        "region": region,
-                        "type":   "Custom Domain v2"
+                    apigw_map[dn] = {"id": dn, "name": dn, "region": region, "type": "Custom Domain v2"}
+                    log("      APIGWv2 domain: " + dn)
+            except Exception:
+                pass
+            try:
+                apis = apigw2.get_apis()
+                for api in apis.get("Items", []):
+                    api_domain = api["ApiId"] + ".execute-api." + region + ".amazonaws.com"
+                    apigw_map[api_domain.lower()] = {
+                        "id": api["ApiId"], "name": api.get("Name", ""),
+                        "region": region, "type": "HTTP"
                     }
             except Exception:
                 pass
-
         except Exception:
             pass
-
     return apigw_map
 
-def check_host(hostname, cf_map, alb_map, apigw_map,
-               waf_assoc, acc_id, acc_name):
-    h          = hostname.lower()
-    ip, cname  = get_full_dns_chain(hostname)
-    r          = empty_result(hostname, ip, cname)
+def get_route53_map(session, acc_id):
+    r53_map = {}
+    try:
+        r53   = session.client("route53", verify=False)
+        zones = r53.list_hosted_zones()
+        for zone in zones.get("HostedZones", []):
+            zone_id = zone["Id"].split("/")[-1]
+            try:
+                records = r53.list_resource_record_sets(HostedZoneId=zone_id)
+                for rec in records.get("ResourceRecordSets", []):
+                    name  = rec.get("Name", "").lower().rstrip(".")
+                    rtype = rec.get("Type", "")
+                    if rtype == "CNAME":
+                        for rr in rec.get("ResourceRecords", []):
+                            val = rr.get("Value", "").lower()
+                            r53_map[name] = {"cname": val, "type": "CNAME", "zone": zone.get("Name", "")}
+                    if "AliasTarget" in rec:
+                        alias_dns = rec["AliasTarget"].get("DNSName", "").lower().rstrip(".")
+                        r53_map[name] = {"cname": alias_dns, "type": "ALIAS", "zone": zone.get("Name", "")}
+                        if ("cloudfront" in alias_dns or "elb.amazonaws" in alias_dns or "execute-api" in alias_dns):
+                            log("      R53 alias: " + name + " -> " + alias_dns)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return r53_map
+
+def check_host(hostname, cf_map, alb_map, apigw_map, r53_map, waf_assoc, acc_id, acc_name):
+    h         = hostname.lower()
+    ip, cname = get_full_dns_chain(hostname)
+    r         = empty_result(hostname, ip, cname)
     r["Account_ID"]   = acc_id
     r["Account_Name"] = acc_name
 
-    # ── 1. Exact CloudFront alias match ──
+    # 1. Exact CloudFront alias
     if h in cf_map:
         info = cf_map[h]
         arn  = info["arn"]
-        r.update({
-            "Resource_Type": "CloudFront",
-            "Resource_Name": info["name"],
-            "Resource_ARN":  arn,
-            "Notes":         ""
-        })
+        r.update({"Resource_Type": "CloudFront", "Resource_Name": info["name"], "Resource_ARN": arn, "Notes": ""})
         if arn in waf_assoc:
             w = waf_assoc[arn]
-            r.update({
-                "WAF_Protected": "YES",
-                "WAF_Name":      w["WAF_Name"],
-                "WAF_Region":    w["WAF_Region"]
-            })
+            r.update({"WAF_Protected": "YES", "WAF_Name": w["WAF_Name"], "WAF_Region": w["WAF_Region"]})
         else:
-            r["Notes"] = "CloudFront found — NO WAF attached"
+            r["Notes"] = "CloudFront found - NO WAF"
         return r
 
-    # ── 2. CNAME resolves to CloudFront ──
+    # 2. Route53 record
+    if h in r53_map:
+        rec    = r53_map[h]
+        target = rec.get("cname", "")
+        if "cloudfront.net" in target:
+            for cf_domain, info in cf_map.items():
+                if info.get("domain", "") in target or target in info.get("domain", ""):
+                    arn = info["arn"]
+                    r.update({"Resource_Type": "CloudFront (via Route53)", "Resource_Name": cf_domain, "Resource_ARN": arn, "Notes": "R53 -> " + target})
+                    if arn in waf_assoc:
+                        w = waf_assoc[arn]
+                        r.update({"WAF_Protected": "YES", "WAF_Name": w["WAF_Name"], "WAF_Region": w["WAF_Region"]})
+                    else:
+                        r["Notes"] = "CloudFront via R53 - NO WAF"
+                    return r
+            r.update({"Resource_Type": "CloudFront (via Route53)", "Notes": "Points to CF: " + target})
+            return r
+        if "elb.amazonaws.com" in target:
+            alb_key = target.rstrip(".")
+            if alb_key in alb_map:
+                info = alb_map[alb_key]
+                r.update({"Resource_Type": "ALB (via Route53)", "Resource_Name": info["name"], "Resource_ARN": info["arn"], "Notes": "R53 -> " + target})
+                if info["arn"] in waf_assoc:
+                    w = waf_assoc[info["arn"]]
+                    r.update({"WAF_Protected": "YES", "WAF_Name": w["WAF_Name"], "WAF_Region": w["WAF_Region"]})
+                else:
+                    r["Notes"] = "ALB via R53 - NO WAF"
+                return r
+        if "execute-api" in target or "amazonaws.com" in target:
+            r.update({"Resource_Type": "API Gateway (via Route53)", "Notes": "R53 -> " + target})
+            return r
+        r.update({"Resource_Type": "Route53 Record", "Notes": rec["type"] + " -> " + target})
+        return r
+
+    # 3. CNAME to CloudFront
     if cname and "cloudfront.net" in cname:
-        # Try to match cname to a distribution
         for cf_domain, info in cf_map.items():
             if info.get("domain", "") in cname:
                 arn = info["arn"]
-                r.update({
-                    "Resource_Type": "CloudFront (via CNAME)",
-                    "Resource_Name": cf_domain,
-                    "Resource_ARN":  arn,
-                    "Notes":         "CNAME: " + cname
-                })
+                r.update({"Resource_Type": "CloudFront (via CNAME)", "Resource_Name": cf_domain, "Resource_ARN": arn, "Notes": "CNAME: " + cname})
                 if arn in waf_assoc:
                     w = waf_assoc[arn]
-                    r.update({
-                        "WAF_Protected": "YES",
-                        "WAF_Name":      w["WAF_Name"],
-                        "WAF_Region":    w["WAF_Region"]
-                    })
+                    r.update({"WAF_Protected": "YES", "WAF_Name": w["WAF_Name"], "WAF_Region": w["WAF_Region"]})
                 else:
-                    r["Notes"] = "CloudFront via CNAME — NO WAF"
+                    r["Notes"] = "CloudFront via CNAME - NO WAF"
                 return r
-        # CloudFront detected but distribution not in this account
-        r.update({
-            "Resource_Type": "CloudFront (other account)",
-            "Notes":         "CNAME to CloudFront: " + cname
-        })
+        r.update({"Resource_Type": "CloudFront (other account)", "Notes": "CNAME to CF: " + cname})
         return r
 
-    # ── 3. Exact ALB DNS match ──
+    # 4. Exact ALB DNS match
     if h in alb_map:
         info = alb_map[h]
-        r.update({
-            "Resource_Type": "ALB",
-            "Resource_Name": info["name"],
-            "Resource_ARN":  info["arn"],
-            "Notes":         ""
-        })
+        r.update({"Resource_Type": "ALB", "Resource_Name": info["name"], "Resource_ARN": info["arn"], "Notes": ""})
         if info["arn"] in waf_assoc:
             w = waf_assoc[info["arn"]]
-            r.update({
-                "WAF_Protected": "YES",
-                "WAF_Name":      w["WAF_Name"],
-                "WAF_Region":    w["WAF_Region"]
-            })
+            r.update({"WAF_Protected": "YES", "WAF_Name": w["WAF_Name"], "WAF_Region": w["WAF_Region"]})
         else:
-            r["Notes"] = "ALB found — NO WAF attached"
+            r["Notes"] = "ALB found - NO WAF"
         return r
 
-    # ── 4. CNAME resolves to ALB ──
+    # 5. CNAME to ALB
     if cname and "elb.amazonaws.com" in cname:
-        alb_cname = cname.lower()
-        if alb_cname in alb_map:
-            info = alb_map[alb_cname]
-            r.update({
-                "Resource_Type": "ALB (via CNAME)",
-                "Resource_Name": info["name"],
-                "Resource_ARN":  info["arn"],
-                "Notes":         "CNAME: " + cname
-            })
+        alb_key = cname.rstrip(".")
+        if alb_key in alb_map:
+            info = alb_map[alb_key]
+            r.update({"Resource_Type": "ALB (via CNAME)", "Resource_Name": info["name"], "Resource_ARN": info["arn"], "Notes": "CNAME: " + cname})
             if info["arn"] in waf_assoc:
                 w = waf_assoc[info["arn"]]
-                r.update({
-                    "WAF_Protected": "YES",
-                    "WAF_Name":      w["WAF_Name"],
-                    "WAF_Region":    w["WAF_Region"]
-                })
+                r.update({"WAF_Protected": "YES", "WAF_Name": w["WAF_Name"], "WAF_Region": w["WAF_Region"]})
             else:
-                r["Notes"] = "ALB via CNAME — NO WAF"
+                r["Notes"] = "ALB via CNAME - NO WAF"
             return r
 
-    # ── 5. API Gateway custom domain ──
+    # 6. API Gateway custom domain
     if h in apigw_map:
         info = apigw_map[h]
-        r.update({
-            "Resource_Type": "API Gateway (" + info["type"] + ")",
-            "Resource_Name": info["name"],
-            "Notes":         "API GW custom domain — WAF via usage plan"
-        })
+        r.update({"Resource_Type": "API Gateway (" + info["type"] + ")", "Resource_Name": info["name"], "Notes": "API GW custom domain"})
         return r
 
-    # ── 6. execute-api pattern ──
+    # 7. execute-api pattern
     if "execute-api" in h:
-        r.update({
-            "Resource_Type": "API Gateway",
-            "Notes":         "Direct API GW URL — check WAF manually"
-        })
+        r.update({"Resource_Type": "API Gateway", "Notes": "Direct API GW URL"})
         return r
 
-    # ── 7. IP-based fallback — compare resolved IPs ──
+    # 8. IP fallback
     if ip and ip != "DNS_FAILED":
-        # Check against ALB IPs
         for alb_dns, info in alb_map.items():
-            alb_ip = dns_lookup(alb_dns)
-            if alb_ip == ip and alb_ip != "DNS_FAILED":
-                r.update({
-                    "Resource_Type": "ALB (by IP match)",
-                    "Resource_Name": info["name"],
-                    "Resource_ARN":  info["arn"],
-                    "Notes":         "Matched by IP: " + ip
-                })
-                if info["arn"] in waf_assoc:
-                    w = waf_assoc[info["arn"]]
-                    r.update({
-                        "WAF_Protected": "YES",
-                        "WAF_Name":      w["WAF_Name"],
-                        "WAF_Region":    w["WAF_Region"]
-                    })
-                else:
-                    r["Notes"] = "ALB by IP — NO WAF"
-                return r
+            try:
+                alb_ip = socket.gethostbyname(alb_dns)
+                if alb_ip == ip:
+                    r.update({"Resource_Type": "ALB (by IP)", "Resource_Name": info["name"], "Resource_ARN": info["arn"], "Notes": "Matched by IP: " + ip})
+                    if info["arn"] in waf_assoc:
+                        w = waf_assoc[info["arn"]]
+                        r.update({"WAF_Protected": "YES", "WAF_Name": w["WAF_Name"], "WAF_Region": w["WAF_Region"]})
+                    else:
+                        r["Notes"] = "ALB by IP - NO WAF"
+                    return r
+            except Exception:
+                pass
 
     return r
 
-# ══════════════════════════════════════════
 # MAIN
-# ══════════════════════════════════════════
-print("=" * 60)
-print("WAF Coverage — All Truist Accounts")
-print("=" * 60)
+log("=" * 60)
+log("WAF Coverage - All Truist Accounts")
+log("=" * 60)
 
-# Load hostnames
 if not os.path.exists(HOSTNAMES_FILE):
-    print("ERROR: hostnames.txt not found!")
+    log("ERROR: hostnames.txt not found!")
     exit(1)
 
 with open(HOSTNAMES_FILE, encoding="utf-8-sig") as f:
     hostnames = [l.strip() for l in f if l.strip()]
 
 if not hostnames:
-    print("ERROR: hostnames.txt is empty!")
+    log("ERROR: hostnames.txt is empty!")
     exit(1)
 
-print("Loaded " + str(len(hostnames)) + " hostnames")
+log("Loaded " + str(len(hostnames)) + " hostnames")
 
-# SSO token
 token = get_sso_token()
 if not token:
-    print("\nERROR: No SSO token!")
-    print("Run: aws sso login --profile waf-search1 --no-verify-ssl")
+    log("ERROR: No SSO token! Run: aws sso login --profile waf-search1 --no-verify-ssl")
     exit(1)
-print("SSO token OK")
+log("SSO token OK")
 
-# Get accounts
 accounts = get_all_accounts(token)
 if not accounts:
-    print("ERROR: No accounts found — re-run SSO login")
+    log("ERROR: No accounts found!")
     exit(1)
 
-# Pre-populate results with DNS info
-print("Resolving DNS for all hostnames...")
+log("\nResolving DNS for all hostnames...")
 results = {}
 for h in hostnames:
-    ip, cname    = get_full_dns_chain(h)
-    results[h]   = empty_result(h, ip, cname)
-    print("  " + h + " -> " + ip)
+    ip, cname  = get_full_dns_chain(h)
+    results[h] = empty_result(h, ip, cname)
+    log("  " + h + " -> " + ip + (" [" + cname + "]" if cname else ""))
 
-print("")
+log("")
 
-# Loop every account
 for i, account in enumerate(accounts):
     acc_id   = account["accountId"]
     acc_name = account.get("accountName", "unknown")
-    print(
-        "[" + str(i+1) + "/" + str(len(accounts)) + "] " +
-        acc_name + " (" + acc_id + ")",
-        end=" "
-    )
+    log("[" + str(i+1) + "/" + str(len(accounts)) + "] " + acc_name + " (" + acc_id + ")")
 
     creds = get_creds(token, acc_id)
     if not creds:
-        print("-- no creds, skip")
+        log("  -- no creds, skip")
         continue
 
     session   = make_session(creds)
-    waf_assoc = get_waf_assoc(session)
-    cf_map    = get_cf_map(session)
-    alb_map   = get_alb_map(session)
-    apigw_map = get_apigw_map(session)
+    waf_assoc = get_waf_assoc(session, acc_id)
+    cf_map    = get_cf_map(session, acc_id)
+    alb_map   = get_alb_map(session, acc_id)
+    apigw_map = get_apigw_map(session, acc_id)
+    r53_map   = get_route53_map(session, acc_id)
 
-    # Skip account if nothing found at all
-    if not waf_assoc and not cf_map and not alb_map and not apigw_map:
-        print("-- empty, skip")
+    if not waf_assoc and not cf_map and not alb_map and not apigw_map and not r53_map:
+        log("  -- empty, skip")
         continue
 
     found_in_account = False
     for hostname in hostnames:
-        # Already confirmed with WAF — skip
         if results[hostname]["WAF_Protected"] == "YES":
             continue
-
-        r = check_host(
-            hostname, cf_map, alb_map,
-            apigw_map, waf_assoc, acc_id, acc_name
-        )
-
+        r = check_host(hostname, cf_map, alb_map, apigw_map, r53_map, waf_assoc, acc_id, acc_name)
         if r["Resource_Type"] != "Not Found":
             results[hostname] = r
             found_in_account  = True
             status = "YES" if r["WAF_Protected"] == "YES" else "NO"
-            print(
-                "\n  FOUND: " + hostname +
-                " -> WAF:" + status +
-                " | " + r["Resource_Type"] +
-                " | " + r.get("Notes", "")
-            )
+            log("  FOUND: " + hostname + " -> WAF:" + status + " | " + r["Resource_Type"] + " | " + r.get("Notes", ""))
 
     if not found_in_account:
-        print("-- nothing found")
+        log("  -- nothing matched")
 
-# Write CSV
-print("\nWriting report: " + OUT_FILE)
+log("\nWriting report: " + OUT_FILE)
 rows = [results[h] for h in hostnames]
 
 with open(OUT_FILE, "w", newline="", encoding="utf-8") as f:
@@ -595,20 +502,20 @@ with open(OUT_FILE, "w", newline="", encoding="utf-8") as f:
         clean = {field: row.get(field, "") for field in FIELDS}
         writer.writerow(clean)
 
-# Summary
+with open(DEBUG_FILE, "w", encoding="utf-8") as f:
+    f.write("\n".join(debug_lines))
+
 protected     = sum(1 for r in rows if r["WAF_Protected"] == "YES")
-not_protected = sum(
-    1 for r in rows
-    if r["WAF_Protected"] == "NO" and r["Resource_Type"] != "Not Found"
-)
+not_protected = sum(1 for r in rows if r["WAF_Protected"] == "NO" and r["Resource_Type"] != "Not Found")
 not_found     = sum(1 for r in rows if r["Resource_Type"] == "Not Found")
 
-print("\n" + "=" * 60)
-print("FINAL SUMMARY")
-print("  Accounts scanned  : " + str(len(accounts)))
-print("  Hostnames checked : " + str(len(rows)))
-print("  WAF protected     : " + str(protected))
-print("  Found - NO WAF    : " + str(not_protected))
-print("  Not found         : " + str(not_found))
-print("  Report saved      : " + OUT_FILE)
-print("=" * 60)
+log("\n" + "=" * 60)
+log("FINAL SUMMARY")
+log("  Accounts scanned  : " + str(len(accounts)))
+log("  Hostnames checked : " + str(len(rows)))
+log("  WAF protected     : " + str(protected))
+log("  Found - NO WAF    : " + str(not_protected))
+log("  Not found         : " + str(not_found))
+log("  Report saved      : " + OUT_FILE)
+log("  Debug log saved   : " + DEBUG_FILE)
+log("=" * 60)
