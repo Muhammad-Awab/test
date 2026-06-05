@@ -1,39 +1,67 @@
 @"
+import boto3
 import socket
-import subprocess
+import ssl
+import os
 
-hostnames = [
-    "api.oneviewmessaging.truist.com",
-    "api.oneviewmessaginglab.truist.com",
-    "api.oneviewmessagingqa.truist.com",
-    "api.truistassist.truist.com",
-    "api.truistassistdev.truist.com",
-    "apiaa.truistassistdev.truist.com",
-    "apiaa.truistassistlab.truist.com",
-    "apiaa.truistassistqa.truist.com",
-    "apib.truistassistlab.truist.com",
-    "apicpcamue1.brnchline.connectdev.truist.com",
-    "apicpcamue1.brnchline.connectprod.truist.com",
-    "apicpcamue1.brnchline.connectqa.truist.com",
-    "apicpcamue1.consdef.connectdev.truist.com",
-    "apicpcamue1.consdef.connectprod.truist.com",
-    "apicpcamue1.consdef.connectqa.truist.com"
-]
+os.environ["PYTHONHTTPSVERIFY"] = "0"
+ssl._create_default_https_context = ssl._create_unverified_context
 
-for h in hostnames:
-    print("=" * 60)
-    print("HOST: " + h)
-    try:
-        ip = socket.gethostbyname(h)
-        print("IP  : " + ip)
-    except Exception as e:
-        print("IP  : DNS_FAILED - " + str(e))
-    r = subprocess.run(
-        ["nslookup", h],
-        capture_output=True, text=True, timeout=10
-    )
-    print("NSLOOKUP:")
-    print(r.stdout)
-"@ | Out-File -FilePath debug_dns.py -Encoding utf8
+# These are the IPs we saw from nslookup
+KNOWN_IPS = {
+    "api.oneviewmessaging.truist.com":    ["18.154.227.118","18.154.227.129","18.154.227.51"],
+    "api.oneviewmessaginglab.truist.com": ["3.171.85.65","3.171.85.84","3.171.85.87","3.171.85.34"],
+    "api.truistassist.truist.com":        ["18.156.229.79","18.154.218.94","18.154.229.41","18.164.229.64"],
+    "api.truistassistdev.truist.com":     ["59.238.152.79"]
+}
 
-python debug_dns.py
+print("Checking if these IPs belong to CloudFront...")
+print("")
+
+for hostname, ips in KNOWN_IPS.items():
+    print("Hostname: " + hostname)
+    for ip in ips:
+        print("  IP: " + ip)
+        # Check if IP is in CloudFront range
+        # CloudFront IPs typically start with:
+        # 13.x, 15.x, 18.x, 3.x, 52.x, 54.x, 64.x, 99.x, 130.x, 143.x, 204.x, 205.x, 216.x
+        first_octet = int(ip.split(".")[0])
+        if first_octet in [3, 13, 15, 18, 52, 54, 64, 99, 130, 143, 204, 205, 216]:
+            print("  -> Likely CloudFront IP")
+        else:
+            print("  -> Likely ALB/Other IP")
+    print("")
+
+# Now check AWS IP ranges officially
+print("Downloading AWS IP ranges to confirm...")
+import urllib.request
+import json
+
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+
+try:
+    with urllib.request.urlopen("https://ip-ranges.amazonaws.com/ip-ranges.json", context=ctx) as response:
+        data = json.loads(response.read())
+    
+    import ipaddress
+    
+    for hostname, ips in KNOWN_IPS.items():
+        print("=" * 50)
+        print("Hostname: " + hostname)
+        for ip in ips:
+            ip_obj = ipaddress.ip_address(ip)
+            for prefix in data["prefixes"]:
+                network = ipaddress.ip_network(prefix["ip_prefix"])
+                if ip_obj in network:
+                    service = prefix.get("service", "")
+                    region  = prefix.get("region", "")
+                    if service in ["CLOUDFRONT", "AMAZON"]:
+                        print("  " + ip + " -> " + service + " (" + region + ")")
+                    break
+except Exception as e:
+    print("Error: " + str(e))
+"@ | Out-File -FilePath check_ips.py -Encoding utf8
+
+python check_ips.py
