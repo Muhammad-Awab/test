@@ -1,3 +1,39 @@
-Remove-Item "$env:USERPROFILE\.aws\sso\cache\*" -Force
-aws sso login --profile waf-search1 --no-verify-ssl
-$env:AWS_CA_BUNDLE = ""
+@"
+import socket
+import subprocess
+
+hostnames = [
+    "api.oneviewmessaging.truist.com",
+    "api.oneviewmessaginglab.truist.com",
+    "api.oneviewmessagingqa.truist.com",
+    "api.truistassist.truist.com",
+    "api.truistassistdev.truist.com",
+    "apiaa.truistassistdev.truist.com",
+    "apiaa.truistassistlab.truist.com",
+    "apiaa.truistassistqa.truist.com",
+    "apib.truistassistlab.truist.com",
+    "apicpcamue1.brnchline.connectdev.truist.com",
+    "apicpcamue1.brnchline.connectprod.truist.com",
+    "apicpcamue1.brnchline.connectqa.truist.com",
+    "apicpcamue1.consdef.connectdev.truist.com",
+    "apicpcamue1.consdef.connectprod.truist.com",
+    "apicpcamue1.consdef.connectqa.truist.com"
+]
+
+for h in hostnames:
+    print("=" * 60)
+    print("HOST: " + h)
+    try:
+        ip = socket.gethostbyname(h)
+        print("IP  : " + ip)
+    except Exception as e:
+        print("IP  : DNS_FAILED - " + str(e))
+    r = subprocess.run(
+        ["nslookup", h],
+        capture_output=True, text=True, timeout=10
+    )
+    print("NSLOOKUP:")
+    print(r.stdout)
+"@ | Out-File -FilePath debug_dns.py -Encoding utf8
+
+python debug_dns.py
