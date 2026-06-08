@@ -9,7 +9,7 @@ import subprocess
 import urllib3
 from datetime import datetime
 
-# Suppress SSL warnings
+# Suppress all SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 os.environ["PYTHONHTTPSVERIFY"] = "0"
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -23,6 +23,7 @@ REGIONS = [
     "eu-west-1", "ap-southeast-1", "ap-northeast-1"
 ]
 
+# Final columns as agreed
 FIELDS = [
     "Custom_Domain_Name",
     "Account_ID",
@@ -33,6 +34,8 @@ FIELDS = [
     "Stage_Name",
     "WebACL_Name",
     "WebACL_ARN",
+    "WAF_Region",
+    "WAF_Managed_By",
     "Region",
     "WAF_Protected",
     "Notes"
@@ -59,7 +62,9 @@ def get_sso_token():
 
 def run_cmd(cmd):
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30
+        )
         if r.stdout.strip():
             return json.loads(r.stdout)
         return {}
@@ -71,10 +76,12 @@ def get_all_accounts(token):
     accounts = []
     next_tok = None
     while True:
-        cmd = ["aws", "sso", "list-accounts",
-               "--access-token", token,
-               "--region", "us-east-1",
-               "--no-verify-ssl", "--output", "json"]
+        cmd = [
+            "aws", "sso", "list-accounts",
+            "--access-token", token,
+            "--region", "us-east-1",
+            "--no-verify-ssl", "--output", "json"
+        ]
         if next_tok:
             cmd += ["--next-token", next_tok]
         data     = run_cmd(cmd)
@@ -104,144 +111,208 @@ def make_session(creds):
         aws_session_token     = creds["sessionToken"]
     )
 
-def get_all_waf_acls(session, region):
-    """Get all WAF WebACLs in a region with their associated resources."""
-    waf_map = {}
+def get_all_waf_acls_in_region(session, region):
+    """
+    Get ALL WAF WebACLs in region with full details.
+    Returns dict: acl_arn -> {name, arn, resources, managed_by}
+    """
+    acls = {}
     try:
         waf  = session.client("wafv2", region_name=region, verify=False)
         resp = waf.list_web_acls(Scope="REGIONAL", Limit=100)
         for acl in resp.get("WebACLs", []):
+            acl_arn  = acl["ARN"]
+            acl_name = acl["Name"]
+
+            # Get all resources this WAF protects
+            resources = []
             try:
-                res = waf.list_resources_for_web_acl(WebACLArn=acl["ARN"])
-                for r_arn in res.get("ResourceArns", []):
-                    waf_map[r_arn] = {
-                        "name": acl["Name"],
-                        "arn":  acl["ARN"]
-                    }
+                res = waf.list_resources_for_web_acl(WebACLArn=acl_arn)
+                resources = res.get("ResourceArns", [])
             except:
                 pass
+
+            # Check if managed by Firewall Manager
+            managed_by = "Direct"
+            try:
+                tags_resp = waf.list_tags_for_resource(ResourceARN=acl_arn)
+                tags = tags_resp.get("TagInfoForResource", {}).get("TagList", [])
+                for tag in tags:
+                    key = tag.get("Key", "").lower()
+                    val = tag.get("Value", "").lower()
+                    if "firewall" in key or "fms" in key or "firewall" in val:
+                        managed_by = "Firewall Manager"
+                        break
+                    if "third" in key or "external" in key or "third" in val:
+                        managed_by = "Third Party"
+                        break
+            except:
+                pass
+
+            # Check FMS policy association
+            if managed_by == "Direct":
+                try:
+                    fms = session.client("fms", region_name="us-east-1", verify=False)
+                    policies = fms.list_policies()
+                    for policy in policies.get("PolicyList", []):
+                        if policy.get("SecurityServiceType") == "WAFV2":
+                            managed_by = "Firewall Manager"
+                            break
+                except:
+                    pass
+
+            acls[acl_arn] = {
+                "name":       acl_name,
+                "arn":        acl_arn,
+                "resources":  resources,
+                "managed_by": managed_by,
+                "region":     region
+            }
     except:
         pass
-    return waf_map
+    return acls
 
 def get_cf_waf_acls(session):
-    """Get all CloudFront WAF WebACLs."""
-    waf_map = {}
+    """Get CloudFront WAF ACLs."""
+    acls = {}
     try:
         waf  = session.client("wafv2", region_name="us-east-1", verify=False)
         resp = waf.list_web_acls(Scope="CLOUDFRONT", Limit=100)
         for acl in resp.get("WebACLs", []):
-            try:
-                res = waf.list_resources_for_web_acl(WebACLArn=acl["ARN"])
-                for r_arn in res.get("ResourceArns", []):
-                    waf_map[r_arn] = {
-                        "name": acl["Name"],
-                        "arn":  acl["ARN"]
-                    }
-            except:
-                pass
-    except:
-        pass
-    return waf_map
-
-def check_waf_for_api(session, region, api_id, api_type="REST"):
-    """
-    Check WAF for an API Gateway at multiple levels:
-    1. Direct resource ARN
-    2. Stage ARN
-    3. Any ACL containing the API ID
-    """
-    waf_name = ""
-    waf_arn  = ""
-    stages   = []
-
-    try:
-        waf     = session.client("wafv2", region_name=region, verify=False)
-        acl_resp = waf.list_web_acls(Scope="REGIONAL", Limit=100)
-
-        for acl in acl_resp.get("WebACLs", []):
-            acl_name = acl["Name"]
             acl_arn  = acl["ARN"]
+            acl_name = acl["Name"]
+            resources = []
             try:
                 res = waf.list_resources_for_web_acl(WebACLArn=acl_arn)
-                for r_arn in res.get("ResourceArns", []):
-                    # Match by API ID in ARN
-                    if api_id in r_arn:
-                        waf_name = acl_name
-                        waf_arn  = acl_arn
-                        # Extract stage from ARN if present
-                        parts = r_arn.split("/stages/")
-                        if len(parts) > 1:
-                            stages.append(parts[1])
-                        return waf_name, waf_arn, stages
+                resources = res.get("ResourceArns", [])
             except:
                 pass
+            acls[acl_arn] = {
+                "name":       acl_name,
+                "arn":        acl_arn,
+                "resources":  resources,
+                "managed_by": "Direct",
+                "region":     "CLOUDFRONT"
+            }
+    except:
+        pass
+    return acls
+
+def find_waf_for_api(session, region, api_id, acc_id):
+    """
+    Find WAF for an API Gateway using ALL possible methods:
+    1. list_resources_for_web_acl — standard check
+    2. FMS compliance check — for FMS-managed WAFs
+    3. Stage ARN check
+    4. Web ACL association on API GW directly
+    """
+    waf_name   = ""
+    waf_arn    = ""
+    waf_region = ""
+    managed_by = ""
+
+    # Method 1 — Get all WAF ACLs and check resources
+    regional_acls = get_all_waf_acls_in_region(session, region)
+
+    for acl_arn, acl_info in regional_acls.items():
+        for r_arn in acl_info["resources"]:
+            if api_id in r_arn:
+                waf_name   = acl_info["name"]
+                waf_arn    = acl_arn
+                waf_region = region
+                managed_by = acl_info["managed_by"]
+                return waf_name, waf_arn, waf_region, managed_by
+
+    # Method 2 — Check stage ARNs for REST APIs
+    try:
+        client = session.client("apigateway", region_name=region, verify=False)
+        stages = client.get_stages(restApiId=api_id)
+        for stage in stages.get("item", []):
+            stage_name = stage.get("stageName", "")
+            stage_arn  = (
+                "arn:aws:apigateway:" + region +
+                "::/restapis/" + api_id +
+                "/stages/" + stage_name
+            )
+            for acl_arn, acl_info in regional_acls.items():
+                if stage_arn in acl_info["resources"]:
+                    waf_name   = acl_info["name"]
+                    waf_arn    = acl_arn
+                    waf_region = region
+                    managed_by = acl_info["managed_by"]
+                    return waf_name, waf_arn, waf_region, managed_by
     except:
         pass
 
-    # Also check stage-level for REST APIs
-    if api_type == "REST":
-        try:
-            client = session.client("apigateway", region_name=region, verify=False)
-            stage_resp = client.get_stages(restApiId=api_id)
-            for stage in stage_resp.get("item", []):
-                stage_name = stage.get("stageName", "")
-                stages.append(stage_name)
-                # Stage ARN format for WAF
-                stage_arn = (
-                    "arn:aws:apigateway:" + region +
-                    "::/restapis/" + api_id +
-                    "/stages/" + stage_name
-                )
+    # Method 3 — FMS compliance check
+    try:
+        fms = session.client("fms", region_name="us-east-1", verify=False)
+        policies = fms.list_policies()
+        for policy in policies.get("PolicyList", []):
+            if policy.get("SecurityServiceType") in ["WAFV2", "WAF"]:
+                policy_id = policy["PolicyId"]
                 try:
-                    waf    = session.client("wafv2", region_name=region, verify=False)
-                    acl_resp = waf.list_web_acls(Scope="REGIONAL", Limit=100)
-                    for acl in acl_resp.get("WebACLs", []):
-                        try:
-                            res = waf.list_resources_for_web_acl(
-                                WebACLArn=acl["ARN"]
-                            )
-                            for r_arn in res.get("ResourceArns", []):
-                                if r_arn == stage_arn or api_id in r_arn:
-                                    waf_name = acl["Name"]
-                                    waf_arn  = acl["ARN"]
-                                    return waf_name, waf_arn, [stage_name]
-                        except:
-                            pass
+                    compliance = fms.list_compliance_status(PolicyId=policy_id)
+                    for status in compliance.get("PolicyComplianceStatusList", []):
+                        if status.get("MemberAccount") == acc_id:
+                            eval_results = status.get("EvaluationResults", [])
+                            for ev in eval_results:
+                                if ev.get("ComplianceStatus") == "COMPLIANT":
+                                    waf_name   = policy.get("PolicyName", "FMS Policy")
+                                    waf_arn    = policy.get("PolicyArn", "")
+                                    waf_region = region
+                                    managed_by = "Firewall Manager"
+                                    return waf_name, waf_arn, waf_region, managed_by
                 except:
                     pass
-        except:
-            pass
+    except:
+        pass
 
-    return waf_name, waf_arn, stages
+    # Method 4 — Direct WAF association on API GW stage
+    try:
+        client = session.client("apigateway", region_name=region, verify=False)
+        stages = client.get_stages(restApiId=api_id)
+        for stage in stages.get("item", []):
+            web_acl_arn = stage.get("webAclArn", "")
+            if web_acl_arn:
+                # Extract WAF name from ARN
+                waf_name   = web_acl_arn.split("/")[-1]
+                waf_arn    = web_acl_arn
+                waf_region = region
+                managed_by = "Direct (Stage)"
+                return waf_name, waf_arn, waf_region, managed_by
+    except:
+        pass
+
+    return waf_name, waf_arn, waf_region, managed_by
 
 def get_apigw_domains(session, acc_id, acc_name):
     """
-    Get ALL API Gateway custom domains from this account
-    across all regions, with WAF association details.
+    Scan all API Gateway custom domains in all regions.
+    Returns list of domain records with WAF details.
     """
     found = []
 
     for region in REGIONS:
 
-        # REST API v1
+        # REST API v1 custom domains
         try:
-            client = session.client(
+            client  = session.client(
                 "apigateway", region_name=region, verify=False
             )
-            resp   = client.get_domain_names(limit=500)
+            resp    = client.get_domain_names(limit=500)
             domains = resp.get("items", [])
 
             if domains:
-                print("    [" + region + "] REST domains: " + str(len(domains)))
+                print("    [" + region + "] " + str(len(domains)) + " REST domains")
 
             for domain in domains:
-                dn       = domain.get("domainName", "")
-                api_id   = ""
-                api_name = ""
+                dn         = domain.get("domainName", "")
+                api_id     = ""
+                api_name   = ""
                 stage_name = ""
 
-                # Get base path mappings to find API ID
+                # Get base path mappings
                 try:
                     mappings = client.get_base_path_mappings(
                         domainName=dn, limit=500
@@ -260,15 +331,20 @@ def get_apigw_domains(session, acc_id, acc_name):
                 except:
                     pass
 
-                # Check WAF
-                waf_name = ""
-                waf_arn  = ""
+                # Find WAF
+                waf_name   = ""
+                waf_arn    = ""
+                waf_region = ""
+                managed_by = ""
+
                 if api_id:
-                    waf_name, waf_arn, stg = check_waf_for_api(
-                        session, region, api_id, "REST"
+                    waf_name, waf_arn, waf_region, managed_by = find_waf_for_api(
+                        session, region, api_id, acc_id
                     )
-                    if stg and not stage_name:
-                        stage_name = ", ".join(stg)
+
+                status = "YES" if waf_name else "NO"
+                print("      " + dn + " | " + api_name + " | WAF:" + status +
+                      (" (" + managed_by + ")" if managed_by else ""))
 
                 found.append({
                     "Custom_Domain_Name": dn,
@@ -280,18 +356,17 @@ def get_apigw_domains(session, acc_id, acc_name):
                     "Stage_Name":         stage_name,
                     "WebACL_Name":        waf_name,
                     "WebACL_ARN":         waf_arn,
+                    "WAF_Region":         waf_region,
+                    "WAF_Managed_By":     managed_by,
                     "Region":             region,
                     "WAF_Protected":      "YES" if waf_name else "NO",
                     "Notes":              ""
                 })
 
-                status = "WAF:YES" if waf_name else "WAF:NO"
-                print("      " + dn + " -> " + api_name + " | " + status)
-
-        except Exception as e:
+        except:
             pass
 
-        # HTTP API v2
+        # HTTP API v2 custom domains
         try:
             client  = session.client(
                 "apigatewayv2", region_name=region, verify=False
@@ -300,7 +375,7 @@ def get_apigw_domains(session, acc_id, acc_name):
             domains = resp.get("Items", [])
 
             if domains:
-                print("    [" + region + "] HTTP domains: " + str(len(domains)))
+                print("    [" + region + "] " + str(len(domains)) + " HTTP domains")
 
             for domain in domains:
                 dn         = domain.get("DomainName", "")
@@ -308,7 +383,6 @@ def get_apigw_domains(session, acc_id, acc_name):
                 api_name   = ""
                 stage_name = ""
 
-                # Get mappings
                 try:
                     mappings = client.get_api_mappings(DomainName=dn)
                     for m in mappings.get("Items", []):
@@ -325,15 +399,19 @@ def get_apigw_domains(session, acc_id, acc_name):
                 except:
                     pass
 
-                # Check WAF
-                waf_name = ""
-                waf_arn  = ""
+                # Find WAF
+                waf_name   = ""
+                waf_arn    = ""
+                waf_region = ""
+                managed_by = ""
+
                 if api_id:
-                    waf_name, waf_arn, stg = check_waf_for_api(
-                        session, region, api_id, "HTTP"
+                    waf_name, waf_arn, waf_region, managed_by = find_waf_for_api(
+                        session, region, api_id, acc_id
                     )
-                    if stg and not stage_name:
-                        stage_name = ", ".join(stg)
+
+                status = "YES" if waf_name else "NO"
+                print("      " + dn + " | " + api_name + " | WAF:" + status)
 
                 found.append({
                     "Custom_Domain_Name": dn,
@@ -345,22 +423,23 @@ def get_apigw_domains(session, acc_id, acc_name):
                     "Stage_Name":         stage_name,
                     "WebACL_Name":        waf_name,
                     "WebACL_ARN":         waf_arn,
+                    "WAF_Region":         waf_region,
+                    "WAF_Managed_By":     managed_by,
                     "Region":             region,
                     "WAF_Protected":      "YES" if waf_name else "NO",
                     "Notes":              ""
                 })
-
-                status = "WAF:YES" if waf_name else "WAF:NO"
-                print("      " + dn + " -> " + api_name + " | " + status)
 
         except:
             pass
 
     return found
 
+# ══════════════════════════════════════════
 # MAIN
+# ══════════════════════════════════════════
 print("=" * 60)
-print("API Gateway WAF Coverage Report")
+print("API Gateway WAF Coverage Report — Final Version")
 print("=" * 60)
 
 # Load hostnames
@@ -385,13 +464,15 @@ if not token:
     exit(1)
 print("SSO token OK")
 
-# Get accounts
+# Get all accounts
 accounts = get_all_accounts(token)
 if not accounts:
     print("ERROR: No accounts found!")
     exit(1)
 
 # Scan all accounts
+print("\nScanning all " + str(len(accounts)) + " accounts...")
+print("=" * 60)
 all_domains = []
 
 for i, account in enumerate(accounts):
@@ -399,8 +480,7 @@ for i, account in enumerate(accounts):
     acc_name = account.get("accountName", "unknown")
 
     if i % 20 == 0:
-        found_count = len(all_domains)
-        print("\n[" + str(i) + "/" + str(len(accounts)) + "] Scanning... Domains found so far: " + str(found_count))
+        print("\n[" + str(i) + "/" + str(len(accounts)) + "] Progress — Domains found: " + str(len(all_domains)))
 
     creds = get_creds(token, acc_id)
     if not creds:
@@ -410,43 +490,49 @@ for i, account in enumerate(accounts):
     domains = get_apigw_domains(session, acc_id, acc_name)
 
     if domains:
-        print("  Account " + acc_name + " (" + acc_id + "): " + str(len(domains)) + " domains found")
+        print("  -> " + acc_name + ": " + str(len(domains)) + " domains")
         all_domains.extend(domains)
 
-print("\n\nTotal API GW custom domains found: " + str(len(all_domains)))
+print("\n\nTotal API GW domains found across all accounts: " + str(len(all_domains)))
 
-# Match to hostnames
-print("\nMatching to your hostnames list...")
-print("-" * 60)
+# Match hostnames to found domains
+print("\nMatching hostnames...")
+print("=" * 60)
 
 matched   = []
 unmatched = []
 
 for hostname in hostnames:
-    match = None
+    match      = None
+    match_type = ""
 
-    # Exact match first
+    # 1. Exact match
     for domain in all_domains:
         if hostname == domain["Custom_Domain_Name"].lower():
-            match = domain
+            match      = domain
+            match_type = "exact"
             break
 
-    # Partial match if no exact match
+    # 2. Partial match
     if not match:
         for domain in all_domains:
             dn = domain["Custom_Domain_Name"].lower()
             if hostname in dn or dn in hostname:
-                match = domain
-                match["Notes"] = "Partial match"
+                match            = dict(domain)
+                match["Notes"]   = "Partial match to: " + domain["Custom_Domain_Name"]
+                match_type       = "partial"
                 break
 
     if match:
         matched.append(match)
         status = "YES" if match["WAF_Protected"] == "YES" else "NO"
-        print("MATCHED   : " + hostname)
-        print("           Account : " + match["Account_Name"])
-        print("           API     : " + match["API_Name"])
-        print("           WAF     : " + status + (" (" + match["WebACL_Name"] + ")" if match["WebACL_Name"] else ""))
+        print("MATCHED   [" + match_type + "]: " + hostname)
+        print("           Account    : " + match["Account_Name"] + " (" + match["Account_ID"].lstrip("'") + ")")
+        print("           API        : " + match["API_Name"] + " (" + match["API_ID"] + ")")
+        print("           WAF        : " + status)
+        if match["WebACL_Name"]:
+            print("           WebACL     : " + match["WebACL_Name"])
+            print("           Managed by : " + match["WAF_Managed_By"])
         print("")
     else:
         row = empty_result(hostname)
@@ -454,7 +540,7 @@ for hostname in hostnames:
         print("NOT FOUND : " + hostname)
 
 # Write CSV
-print("\nWriting report: " + OUT_FILE)
+print("\nWriting: " + OUT_FILE)
 rows = matched + unmatched
 
 with open(OUT_FILE, "w", newline="", encoding="utf-8") as f:
@@ -466,13 +552,17 @@ with open(OUT_FILE, "w", newline="", encoding="utf-8") as f:
 # Summary
 protected     = sum(1 for r in matched if r["WAF_Protected"] == "YES")
 not_protected = sum(1 for r in matched if r["WAF_Protected"] == "NO")
+fms_managed   = sum(1 for r in matched if "Firewall Manager" in r.get("WAF_Managed_By", ""))
+third_party   = sum(1 for r in matched if "Third" in r.get("WAF_Managed_By", ""))
 
 print("\n" + "=" * 60)
 print("FINAL SUMMARY")
-print("  Total hostnames   : " + str(len(hostnames)))
-print("  Matched to API GW : " + str(len(matched)))
-print("  WAF protected     : " + str(protected))
-print("  Found - NO WAF    : " + str(not_protected))
-print("  Not found         : " + str(len(unmatched)))
-print("  Report saved      : " + OUT_FILE)
+print("  Total hostnames        : " + str(len(hostnames)))
+print("  Matched to API GW      : " + str(len(matched)))
+print("  WAF protected          : " + str(protected))
+print("  Found - NO WAF         : " + str(not_protected))
+print("  FMS managed            : " + str(fms_managed))
+print("  Third party            : " + str(third_party))
+print("  Not found in any acct  : " + str(len(unmatched)))
+print("  Report saved           : " + OUT_FILE)
 print("=" * 60)
