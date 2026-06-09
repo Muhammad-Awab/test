@@ -9,25 +9,24 @@ import subprocess
 import urllib3
 from datetime import datetime
 
-# Suppress all SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 os.environ["PYTHONHTTPSVERIFY"] = "0"
 ssl._create_default_https_context = ssl._create_unverified_context
 
 HOSTNAMES_FILE = "hostnames.txt"
 ROLE_NAME      = "G-ROLE-AWS-ENT-WAFADMIN-RO"
-OUT_FILE       = "waf_apigw_report_" + datetime.now().strftime("%Y%m%d_%H%M") + ".csv"
+OUT_FILE       = "waf_full_report_" + datetime.now().strftime("%Y%m%d_%H%M") + ".csv"
 
 REGIONS = [
     "us-east-1", "us-east-2", "us-west-1", "us-west-2",
     "eu-west-1", "ap-southeast-1", "ap-northeast-1"
 ]
 
-# Final columns as agreed
 FIELDS = [
     "Custom_Domain_Name",
     "Account_ID",
     "Account_Name",
+    "Resource_Type",
     "API_Name",
     "API_ID",
     "API_Type",
@@ -62,9 +61,7 @@ def get_sso_token():
 
 def run_cmd(cmd):
     try:
-        r = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30
-        )
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if r.stdout.strip():
             return json.loads(r.stdout)
         return {}
@@ -111,200 +108,226 @@ def make_session(creds):
         aws_session_token     = creds["sessionToken"]
     )
 
-def get_all_waf_acls_in_region(session, region):
+# ─────────────────────────────────────────
+# WAF HELPERS
+# ─────────────────────────────────────────
+
+def get_regional_waf_map(session, region):
     """
-    Get ALL WAF WebACLs in region with full details.
-    Returns dict: acl_arn -> {name, arn, resources, managed_by}
+    Returns dict: resource_arn -> {waf_name, waf_arn, managed_by}
+    For REGIONAL WAFs (API GW, ALB).
     """
-    acls = {}
+    waf_map = {}
     try:
         waf  = session.client("wafv2", region_name=region, verify=False)
         resp = waf.list_web_acls(Scope="REGIONAL", Limit=100)
         for acl in resp.get("WebACLs", []):
-            acl_arn  = acl["ARN"]
             acl_name = acl["Name"]
-
-            # Get all resources this WAF protects
-            resources = []
-            try:
-                res = waf.list_resources_for_web_acl(WebACLArn=acl_arn)
-                resources = res.get("ResourceArns", [])
-            except:
-                pass
-
-            # Check if managed by Firewall Manager
+            acl_arn  = acl["ARN"]
             managed_by = "Direct"
+
+            # Check if FMS managed via tags
             try:
                 tags_resp = waf.list_tags_for_resource(ResourceARN=acl_arn)
                 tags = tags_resp.get("TagInfoForResource", {}).get("TagList", [])
                 for tag in tags:
-                    key = tag.get("Key", "").lower()
-                    val = tag.get("Value", "").lower()
-                    if "firewall" in key or "fms" in key or "firewall" in val:
+                    k = tag.get("Key", "").lower()
+                    v = tag.get("Value", "").lower()
+                    if "fms" in k or "firewall" in k or "fms" in v:
                         managed_by = "Firewall Manager"
                         break
-                    if "third" in key or "external" in key or "third" in val:
-                        managed_by = "Third Party"
+            except:
+                pass
+
+            # Get all resources this ACL protects
+            try:
+                res = waf.list_resources_for_web_acl(WebACLArn=acl_arn)
+                for r_arn in res.get("ResourceArns", []):
+                    waf_map[r_arn] = {
+                        "waf_name":   acl_name,
+                        "waf_arn":    acl_arn,
+                        "managed_by": managed_by,
+                        "waf_region": region
+                    }
+            except:
+                pass
+    except:
+        pass
+    return waf_map
+
+def get_cloudfront_waf_map(session):
+    """
+    Returns dict: cf_distribution_arn -> {waf_name, waf_arn, managed_by}
+    Uses list_distributions_by_web_acl_id (correct CF method per AWS docs).
+    Also maps domain aliases -> distribution ARN.
+    """
+    cf_domain_map = {}  # alias/domain -> {waf info + dist info}
+
+    try:
+        # Step 1 - Get all CloudFront WAF ACLs
+        waf  = session.client("wafv2", region_name="us-east-1", verify=False)
+        resp = waf.list_web_acls(Scope="CLOUDFRONT", Limit=100)
+        cf_acls = resp.get("WebACLs", [])
+
+        for acl in cf_acls:
+            acl_name = acl["Name"]
+            acl_arn  = acl["ARN"]
+            acl_id   = acl["Id"]
+            managed_by = "Direct"
+
+            try:
+                tags_resp = waf.list_tags_for_resource(ResourceARN=acl_arn)
+                tags = tags_resp.get("TagInfoForResource", {}).get("TagList", [])
+                for tag in tags:
+                    k = tag.get("Key", "").lower()
+                    if "fms" in k or "firewall" in k:
+                        managed_by = "Firewall Manager"
                         break
             except:
                 pass
 
-            # Check FMS policy association
-            if managed_by == "Direct":
-                try:
-                    fms = session.client("fms", region_name="us-east-1", verify=False)
-                    policies = fms.list_policies()
-                    for policy in policies.get("PolicyList", []):
-                        if policy.get("SecurityServiceType") == "WAFV2":
-                            managed_by = "Firewall Manager"
-                            break
-                except:
-                    pass
-
-            acls[acl_arn] = {
-                "name":       acl_name,
-                "arn":        acl_arn,
-                "resources":  resources,
-                "managed_by": managed_by,
-                "region":     region
-            }
-    except:
-        pass
-    return acls
-
-def get_cf_waf_acls(session):
-    """Get CloudFront WAF ACLs."""
-    acls = {}
-    try:
-        waf  = session.client("wafv2", region_name="us-east-1", verify=False)
-        resp = waf.list_web_acls(Scope="CLOUDFRONT", Limit=100)
-        for acl in resp.get("WebACLs", []):
-            acl_arn  = acl["ARN"]
-            acl_name = acl["Name"]
-            resources = []
+            # Step 2 - Use list_distributions_by_web_acl_id (correct method for CF)
             try:
-                res = waf.list_resources_for_web_acl(WebACLArn=acl_arn)
-                resources = res.get("ResourceArns", [])
-            except:
-                pass
-            acls[acl_arn] = {
-                "name":       acl_name,
-                "arn":        acl_arn,
-                "resources":  resources,
-                "managed_by": "Direct",
-                "region":     "CLOUDFRONT"
-            }
-    except:
-        pass
-    return acls
+                cf_client = session.client("cloudfront", verify=False)
+                dist_resp = cf_client.list_distributions_by_web_acl_id(
+                    WebAclId=acl_arn,
+                    MaxItems="100"
+                )
+                dist_list = dist_resp.get("DistributionList", {}).get("Items", [])
 
-def find_waf_for_api(session, region, api_id, acc_id):
-    """
-    Find WAF for an API Gateway using ALL possible methods:
-    1. list_resources_for_web_acl — standard check
-    2. FMS compliance check — for FMS-managed WAFs
-    3. Stage ARN check
-    4. Web ACL association on API GW directly
-    """
-    waf_name   = ""
-    waf_arn    = ""
-    waf_region = ""
-    managed_by = ""
+                for dist in dist_list:
+                    dist_arn    = dist.get("ARN", "")
+                    dist_domain = dist.get("DomainName", "").lower()
 
-    # Method 1 — Get all WAF ACLs and check resources
-    regional_acls = get_all_waf_acls_in_region(session, region)
+                    # Map the CF domain itself
+                    cf_domain_map[dist_domain] = {
+                        "waf_name":   acl_name,
+                        "waf_arn":    acl_arn,
+                        "managed_by": managed_by,
+                        "dist_arn":   dist_arn,
+                        "dist_domain": dist_domain,
+                        "resource_type": "CloudFront"
+                    }
 
-    for acl_arn, acl_info in regional_acls.items():
-        for r_arn in acl_info["resources"]:
-            if api_id in r_arn:
-                waf_name   = acl_info["name"]
-                waf_arn    = acl_arn
-                waf_region = region
-                managed_by = acl_info["managed_by"]
-                return waf_name, waf_arn, waf_region, managed_by
+                    # Map ALL custom aliases
+                    aliases = dist.get("Aliases", {}).get("Items", [])
+                    for alias in aliases:
+                        cf_domain_map[alias.lower()] = {
+                            "waf_name":    acl_name,
+                            "waf_arn":     acl_arn,
+                            "managed_by":  managed_by,
+                            "dist_arn":    dist_arn,
+                            "dist_domain": dist_domain,
+                            "resource_type": "CloudFront"
+                        }
 
-    # Method 2 — Check stage ARNs for REST APIs
-    try:
-        client = session.client("apigateway", region_name=region, verify=False)
-        stages = client.get_stages(restApiId=api_id)
-        for stage in stages.get("item", []):
-            stage_name = stage.get("stageName", "")
-            stage_arn  = (
-                "arn:aws:apigateway:" + region +
-                "::/restapis/" + api_id +
-                "/stages/" + stage_name
-            )
-            for acl_arn, acl_info in regional_acls.items():
-                if stage_arn in acl_info["resources"]:
-                    waf_name   = acl_info["name"]
-                    waf_arn    = acl_arn
-                    waf_region = region
-                    managed_by = acl_info["managed_by"]
-                    return waf_name, waf_arn, waf_region, managed_by
-    except:
-        pass
-
-    # Method 3 — FMS compliance check
-    try:
-        fms = session.client("fms", region_name="us-east-1", verify=False)
-        policies = fms.list_policies()
-        for policy in policies.get("PolicyList", []):
-            if policy.get("SecurityServiceType") in ["WAFV2", "WAF"]:
-                policy_id = policy["PolicyId"]
+            except Exception as e:
+                # Fallback: get all CF distributions and check webAclId
                 try:
-                    compliance = fms.list_compliance_status(PolicyId=policy_id)
-                    for status in compliance.get("PolicyComplianceStatusList", []):
-                        if status.get("MemberAccount") == acc_id:
-                            eval_results = status.get("EvaluationResults", [])
-                            for ev in eval_results:
-                                if ev.get("ComplianceStatus") == "COMPLIANT":
-                                    waf_name   = policy.get("PolicyName", "FMS Policy")
-                                    waf_arn    = policy.get("PolicyArn", "")
-                                    waf_region = region
-                                    managed_by = "Firewall Manager"
-                                    return waf_name, waf_arn, waf_region, managed_by
+                    cf_client = session.client("cloudfront", verify=False)
+                    all_resp  = cf_client.list_distributions()
+                    all_dists = all_resp.get("DistributionList", {}).get("Items", [])
+
+                    for dist in all_dists:
+                        dist_acl_id = dist.get("WebACLId", "")
+                        if not dist_acl_id:
+                            # Check via get_distribution_config
+                            try:
+                                config = cf_client.get_distribution_config(
+                                    Id=dist["Id"]
+                                )
+                                dist_acl_id = config.get(
+                                    "DistributionConfig", {}
+                                ).get("WebACLId", "")
+                            except:
+                                pass
+
+                        if dist_acl_id and (acl_arn in dist_acl_id or acl_id in dist_acl_id):
+                            dist_arn    = dist.get("ARN", "")
+                            dist_domain = dist.get("DomainName", "").lower()
+
+                            cf_domain_map[dist_domain] = {
+                                "waf_name":    acl_name,
+                                "waf_arn":     acl_arn,
+                                "managed_by":  managed_by,
+                                "dist_arn":    dist_arn,
+                                "dist_domain": dist_domain,
+                                "resource_type": "CloudFront"
+                            }
+
+                            aliases = dist.get("Aliases", {}).get("Items", [])
+                            for alias in aliases:
+                                cf_domain_map[alias.lower()] = {
+                                    "waf_name":    acl_name,
+                                    "waf_arn":     acl_arn,
+                                    "managed_by":  managed_by,
+                                    "dist_arn":    dist_arn,
+                                    "dist_domain": dist_domain,
+                                    "resource_type": "CloudFront"
+                                }
                 except:
                     pass
+
     except:
         pass
 
-    # Method 4 — Direct WAF association on API GW stage
+    # Also scan ALL CF distributions for webAclId even without WAF ACL list
     try:
-        client = session.client("apigateway", region_name=region, verify=False)
-        stages = client.get_stages(restApiId=api_id)
-        for stage in stages.get("item", []):
-            web_acl_arn = stage.get("webAclArn", "")
-            if web_acl_arn:
-                # Extract WAF name from ARN
-                waf_name   = web_acl_arn.split("/")[-1]
-                waf_arn    = web_acl_arn
-                waf_region = region
-                managed_by = "Direct (Stage)"
-                return waf_name, waf_arn, waf_region, managed_by
+        cf_client = session.client("cloudfront", verify=False)
+        all_resp  = cf_client.list_distributions()
+        all_dists = all_resp.get("DistributionList", {}).get("Items", [])
+
+        for dist in all_dists:
+            dist_arn    = dist.get("ARN", "")
+            dist_domain = dist.get("DomainName", "").lower()
+            aliases     = dist.get("Aliases", {}).get("Items", [])
+            web_acl_id  = dist.get("WebACLId", "")
+
+            # If not already mapped, add without WAF info
+            all_aliases = [dist_domain] + [a.lower() for a in aliases]
+            for alias in all_aliases:
+                if alias not in cf_domain_map:
+                    entry = {
+                        "waf_name":    "",
+                        "waf_arn":     web_acl_id,
+                        "managed_by":  "",
+                        "dist_arn":    dist_arn,
+                        "dist_domain": dist_domain,
+                        "resource_type": "CloudFront"
+                    }
+                    if web_acl_id:
+                        entry["waf_name"] = web_acl_id.split("/")[-1]
+                        entry["managed_by"] = "Direct"
+                    cf_domain_map[alias] = entry
+
     except:
         pass
 
-    return waf_name, waf_arn, waf_region, managed_by
+    return cf_domain_map
 
-def get_apigw_domains(session, acc_id, acc_name):
+# ─────────────────────────────────────────
+# API GATEWAY SCANNER
+# ─────────────────────────────────────────
+
+def get_apigw_domain_map(session, acc_id, acc_name):
     """
-    Scan all API Gateway custom domains in all regions.
-    Returns list of domain records with WAF details.
+    Returns list of dicts for all API GW custom domains.
     """
     found = []
 
     for region in REGIONS:
 
-        # REST API v1 custom domains
+        # Build regional WAF map once per region
+        regional_waf = get_regional_waf_map(session, region)
+
+        # REST API v1
         try:
-            client  = session.client(
-                "apigateway", region_name=region, verify=False
-            )
+            client  = session.client("apigateway", region_name=region, verify=False)
             resp    = client.get_domain_names(limit=500)
             domains = resp.get("items", [])
 
             if domains:
-                print("    [" + region + "] " + str(len(domains)) + " REST domains")
+                print("    [" + region + "] REST: " + str(len(domains)))
 
             for domain in domains:
                 dn         = domain.get("domainName", "")
@@ -312,7 +335,6 @@ def get_apigw_domains(session, acc_id, acc_name):
                 api_name   = ""
                 stage_name = ""
 
-                # Get base path mappings
                 try:
                     mappings = client.get_base_path_mappings(
                         domainName=dn, limit=500
@@ -331,51 +353,90 @@ def get_apigw_domains(session, acc_id, acc_name):
                 except:
                     pass
 
-                # Find WAF
+                # Find WAF — Method 1: via resource ARN map
                 waf_name   = ""
                 waf_arn    = ""
-                waf_region = ""
                 managed_by = ""
 
                 if api_id:
-                    waf_name, waf_arn, waf_region, managed_by = find_waf_for_api(
-                        session, region, api_id, acc_id
-                    )
+                    for r_arn, w_info in regional_waf.items():
+                        if api_id in r_arn:
+                            waf_name   = w_info["waf_name"]
+                            waf_arn    = w_info["waf_arn"]
+                            managed_by = w_info["managed_by"]
+                            break
 
-                status = "YES" if waf_name else "NO"
-                print("      " + dn + " | " + api_name + " | WAF:" + status +
-                      (" (" + managed_by + ")" if managed_by else ""))
+                # Method 2: direct webAclArn on stage
+                if not waf_name and api_id:
+                    try:
+                        stages = client.get_stages(restApiId=api_id)
+                        for stage in stages.get("item", []):
+                            web_acl = stage.get("webAclArn", "")
+                            sn      = stage.get("stageName", "")
+                            if web_acl:
+                                waf_name   = web_acl.split("/")[-1]
+                                waf_arn    = web_acl
+                                managed_by = "Direct (Stage)"
+                                if not stage_name:
+                                    stage_name = sn
+                                break
+                    except:
+                        pass
+
+                # Method 3: FMS compliance
+                if not waf_name:
+                    try:
+                        fms = session.client(
+                            "fms", region_name="us-east-1", verify=False
+                        )
+                        policies = fms.list_policies()
+                        for pol in policies.get("PolicyList", []):
+                            if pol.get("SecurityServiceType") in ["WAFV2", "WAF"]:
+                                try:
+                                    comp = fms.list_compliance_status(
+                                        PolicyId=pol["PolicyId"]
+                                    )
+                                    for s in comp.get("PolicyComplianceStatusList", []):
+                                        if s.get("MemberAccount") == acc_id:
+                                            for ev in s.get("EvaluationResults", []):
+                                                if ev.get("ComplianceStatus") == "COMPLIANT":
+                                                    waf_name   = pol.get("PolicyName", "FMS")
+                                                    waf_arn    = pol.get("PolicyArn", "")
+                                                    managed_by = "Firewall Manager"
+                                                    break
+                                except:
+                                    pass
+                                if waf_name:
+                                    break
+                    except:
+                        pass
 
                 found.append({
-                    "Custom_Domain_Name": dn,
-                    "Account_ID":         "'" + acc_id,
-                    "Account_Name":       acc_name,
-                    "API_Name":           api_name,
-                    "API_ID":             api_id,
-                    "API_Type":           "REST",
-                    "Stage_Name":         stage_name,
-                    "WebACL_Name":        waf_name,
-                    "WebACL_ARN":         waf_arn,
-                    "WAF_Region":         waf_region,
-                    "WAF_Managed_By":     managed_by,
-                    "Region":             region,
-                    "WAF_Protected":      "YES" if waf_name else "NO",
-                    "Notes":              ""
+                    "dn":          dn,
+                    "api_id":      api_id,
+                    "api_name":    api_name,
+                    "api_type":    "REST",
+                    "stage_name":  stage_name,
+                    "waf_name":    waf_name,
+                    "waf_arn":     waf_arn,
+                    "managed_by":  managed_by,
+                    "region":      region,
+                    "acc_id":      acc_id,
+                    "acc_name":    acc_name,
+                    "res_type":    "API Gateway"
                 })
 
         except:
             pass
 
-        # HTTP API v2 custom domains
+        # HTTP API v2
         try:
-            client  = session.client(
-                "apigatewayv2", region_name=region, verify=False
-            )
+            client  = session.client("apigatewayv2", region_name=region, verify=False)
             resp    = client.get_domain_names()
             domains = resp.get("Items", [])
 
             if domains:
-                print("    [" + region + "] " + str(len(domains)) + " HTTP domains")
+                print("    [" + region + "] HTTP: " + str(len(domains)))
 
             for domain in domains:
                 dn         = domain.get("DomainName", "")
@@ -399,35 +460,31 @@ def get_apigw_domains(session, acc_id, acc_name):
                 except:
                     pass
 
-                # Find WAF
                 waf_name   = ""
                 waf_arn    = ""
-                waf_region = ""
                 managed_by = ""
 
                 if api_id:
-                    waf_name, waf_arn, waf_region, managed_by = find_waf_for_api(
-                        session, region, api_id, acc_id
-                    )
-
-                status = "YES" if waf_name else "NO"
-                print("      " + dn + " | " + api_name + " | WAF:" + status)
+                    for r_arn, w_info in regional_waf.items():
+                        if api_id in r_arn:
+                            waf_name   = w_info["waf_name"]
+                            waf_arn    = w_info["waf_arn"]
+                            managed_by = w_info["managed_by"]
+                            break
 
                 found.append({
-                    "Custom_Domain_Name": dn,
-                    "Account_ID":         "'" + acc_id,
-                    "Account_Name":       acc_name,
-                    "API_Name":           api_name,
-                    "API_ID":             api_id,
-                    "API_Type":           "HTTP",
-                    "Stage_Name":         stage_name,
-                    "WebACL_Name":        waf_name,
-                    "WebACL_ARN":         waf_arn,
-                    "WAF_Region":         waf_region,
-                    "WAF_Managed_By":     managed_by,
-                    "Region":             region,
-                    "WAF_Protected":      "YES" if waf_name else "NO",
-                    "Notes":              ""
+                    "dn":         dn,
+                    "api_id":     api_id,
+                    "api_name":   api_name,
+                    "api_type":   "HTTP",
+                    "stage_name": stage_name,
+                    "waf_name":   waf_name,
+                    "waf_arn":    waf_arn,
+                    "managed_by": managed_by,
+                    "region":     region,
+                    "acc_id":     acc_id,
+                    "acc_name":   acc_name,
+                    "res_type":   "API Gateway"
                 })
 
         except:
@@ -435,14 +492,37 @@ def get_apigw_domains(session, acc_id, acc_name):
 
     return found
 
-# ══════════════════════════════════════════
+# ─────────────────────────────────────────
+# MATCH HOSTNAME TO RESOURCE
+# ─────────────────────────────────────────
+
+def build_csv_row(hostname, resource, res_type):
+    acc_id = resource.get("acc_id", "")
+    return {
+        "Custom_Domain_Name": hostname,
+        "Account_ID":         "'" + acc_id,
+        "Account_Name":       resource.get("acc_name", ""),
+        "Resource_Type":      res_type,
+        "API_Name":           resource.get("api_name", ""),
+        "API_ID":             resource.get("api_id", ""),
+        "API_Type":           resource.get("api_type", ""),
+        "Stage_Name":         resource.get("stage_name", ""),
+        "WebACL_Name":        resource.get("waf_name", ""),
+        "WebACL_ARN":         resource.get("waf_arn", ""),
+        "WAF_Region":         resource.get("region", ""),
+        "WAF_Managed_By":     resource.get("managed_by", ""),
+        "Region":             resource.get("region", ""),
+        "WAF_Protected":      "YES" if resource.get("waf_name") else "NO",
+        "Notes":              resource.get("notes", "")
+    }
+
+# ─────────────────────────────────────────
 # MAIN
-# ══════════════════════════════════════════
+# ─────────────────────────────────────────
 print("=" * 60)
-print("API Gateway WAF Coverage Report — Final Version")
+print("WAF Coverage Report — API Gateway + CloudFront")
 print("=" * 60)
 
-# Load hostnames
 if not os.path.exists(HOSTNAMES_FILE):
     print("ERROR: hostnames.txt not found!")
     exit(1)
@@ -456,88 +536,135 @@ if not hostnames:
 
 print("Loaded " + str(len(hostnames)) + " hostnames")
 
-# SSO token
 token = get_sso_token()
 if not token:
     print("ERROR: No SSO token!")
     print("Run: aws sso login --profile waf-search1 --no-verify-ssl")
     exit(1)
-print("SSO token OK")
+print("SSO token OK\n")
 
-# Get all accounts
 accounts = get_all_accounts(token)
 if not accounts:
     print("ERROR: No accounts found!")
     exit(1)
 
-# Scan all accounts
-print("\nScanning all " + str(len(accounts)) + " accounts...")
-print("=" * 60)
-all_domains = []
+print("\nScanning all " + str(len(accounts)) + " accounts...\n")
+
+all_apigw_domains = []   # list of dicts from API GW scan
+all_cf_domains    = {}   # alias -> waf info from CF scan
 
 for i, account in enumerate(accounts):
     acc_id   = account["accountId"]
     acc_name = account.get("accountName", "unknown")
 
     if i % 20 == 0:
-        print("\n[" + str(i) + "/" + str(len(accounts)) + "] Progress — Domains found: " + str(len(all_domains)))
+        apigw_count = len(all_apigw_domains)
+        cf_count    = len(all_cf_domains)
+        print("[" + str(i) + "/" + str(len(accounts)) + "] APIGW domains: " +
+              str(apigw_count) + " | CF domains/aliases: " + str(cf_count))
 
     creds = get_creds(token, acc_id)
     if not creds:
         continue
 
     session = make_session(creds)
-    domains = get_apigw_domains(session, acc_id, acc_name)
 
-    if domains:
-        print("  -> " + acc_name + ": " + str(len(domains)) + " domains")
-        all_domains.extend(domains)
+    # Scan API Gateway
+    apigw_results = get_apigw_domain_map(session, acc_id, acc_name)
+    if apigw_results:
+        all_apigw_domains.extend(apigw_results)
 
-print("\n\nTotal API GW domains found across all accounts: " + str(len(all_domains)))
+    # Scan CloudFront — uses correct list_distributions_by_web_acl_id
+    cf_results = get_cloudfront_waf_map(session)
+    if cf_results:
+        for alias, info in cf_results.items():
+            if alias not in all_cf_domains:
+                info["acc_id"]   = acc_id
+                info["acc_name"] = acc_name
+                all_cf_domains[alias] = info
+            elif not all_cf_domains[alias].get("waf_name") and info.get("waf_name"):
+                info["acc_id"]   = acc_id
+                info["acc_name"] = acc_name
+                all_cf_domains[alias] = info
 
-# Match hostnames to found domains
-print("\nMatching hostnames...")
+print("\n\nScan complete!")
+print("  API GW domains found     : " + str(len(all_apigw_domains)))
+print("  CF aliases/domains found : " + str(len(all_cf_domains)))
+
+# Match hostnames
+print("\nMatching " + str(len(hostnames)) + " hostnames...")
 print("=" * 60)
 
 matched   = []
 unmatched = []
 
 for hostname in hostnames:
-    match      = None
-    match_type = ""
+    row        = None
+    match_note = ""
 
-    # 1. Exact match
-    for domain in all_domains:
-        if hostname == domain["Custom_Domain_Name"].lower():
-            match      = domain
-            match_type = "exact"
+    # 1. Exact API GW match
+    for d in all_apigw_domains:
+        if hostname == d["dn"].lower():
+            row = build_csv_row(hostname, d, "API Gateway")
             break
 
-    # 2. Partial match
-    if not match:
-        for domain in all_domains:
-            dn = domain["Custom_Domain_Name"].lower()
+    # 2. Exact CloudFront alias match
+    if not row and hostname in all_cf_domains:
+        cf = all_cf_domains[hostname]
+        row = build_csv_row(hostname, {
+            "acc_id":     cf.get("acc_id", ""),
+            "acc_name":   cf.get("acc_name", ""),
+            "api_name":   cf.get("dist_domain", ""),
+            "api_id":     cf.get("dist_arn", ""),
+            "api_type":   "",
+            "stage_name": "",
+            "waf_name":   cf.get("waf_name", ""),
+            "waf_arn":    cf.get("waf_arn", ""),
+            "managed_by": cf.get("managed_by", ""),
+            "region":     "us-east-1"
+        }, "CloudFront")
+
+    # 3. Partial API GW match
+    if not row:
+        for d in all_apigw_domains:
+            dn = d["dn"].lower()
             if hostname in dn or dn in hostname:
-                match            = dict(domain)
-                match["Notes"]   = "Partial match to: " + domain["Custom_Domain_Name"]
-                match_type       = "partial"
+                row = build_csv_row(hostname, d, "API Gateway")
+                row["Notes"] = "Partial match: " + d["dn"]
                 break
 
-    if match:
-        matched.append(match)
-        status = "YES" if match["WAF_Protected"] == "YES" else "NO"
-        print("MATCHED   [" + match_type + "]: " + hostname)
-        print("           Account    : " + match["Account_Name"] + " (" + match["Account_ID"].lstrip("'") + ")")
-        print("           API        : " + match["API_Name"] + " (" + match["API_ID"] + ")")
-        print("           WAF        : " + status)
-        if match["WebACL_Name"]:
-            print("           WebACL     : " + match["WebACL_Name"])
-            print("           Managed by : " + match["WAF_Managed_By"])
+    # 4. Partial CloudFront match
+    if not row:
+        for alias, cf in all_cf_domains.items():
+            if hostname in alias or alias in hostname:
+                row = build_csv_row(hostname, {
+                    "acc_id":     cf.get("acc_id", ""),
+                    "acc_name":   cf.get("acc_name", ""),
+                    "api_name":   cf.get("dist_domain", ""),
+                    "api_id":     cf.get("dist_arn", ""),
+                    "api_type":   "",
+                    "stage_name": "",
+                    "waf_name":   cf.get("waf_name", ""),
+                    "waf_arn":    cf.get("waf_arn", ""),
+                    "managed_by": cf.get("managed_by", ""),
+                    "region":     "us-east-1"
+                }, "CloudFront")
+                row["Notes"] = "Partial CF match: " + alias
+                break
+
+    if row:
+        matched.append(row)
+        status = "YES" if row["WAF_Protected"] == "YES" else "NO"
+        print("MATCHED: " + hostname)
+        print("         Type   : " + row["Resource_Type"])
+        print("         Account: " + row["Account_Name"])
+        print("         WAF    : " + status +
+              (" -> " + row["WebACL_Name"] if row["WebACL_Name"] else ""))
         print("")
     else:
-        row = empty_result(hostname)
-        unmatched.append(row)
-        print("NOT FOUND : " + hostname)
+        r = empty_result(hostname)
+        unmatched.append(r)
+        print("NOT FOUND: " + hostname)
 
 # Write CSV
 print("\nWriting: " + OUT_FILE)
@@ -549,20 +676,19 @@ with open(OUT_FILE, "w", newline="", encoding="utf-8") as f:
     for row in rows:
         writer.writerow({field: row.get(field, "") for field in FIELDS})
 
-# Summary
-protected     = sum(1 for r in matched if r["WAF_Protected"] == "YES")
-not_protected = sum(1 for r in matched if r["WAF_Protected"] == "NO")
-fms_managed   = sum(1 for r in matched if "Firewall Manager" in r.get("WAF_Managed_By", ""))
-third_party   = sum(1 for r in matched if "Third" in r.get("WAF_Managed_By", ""))
+protected  = sum(1 for r in matched if r["WAF_Protected"] == "YES")
+no_waf     = sum(1 for r in matched if r["WAF_Protected"] == "NO")
+apigw_rows = sum(1 for r in matched if r["Resource_Type"] == "API Gateway")
+cf_rows    = sum(1 for r in matched if r["Resource_Type"] == "CloudFront")
 
 print("\n" + "=" * 60)
 print("FINAL SUMMARY")
-print("  Total hostnames        : " + str(len(hostnames)))
-print("  Matched to API GW      : " + str(len(matched)))
-print("  WAF protected          : " + str(protected))
-print("  Found - NO WAF         : " + str(not_protected))
-print("  FMS managed            : " + str(fms_managed))
-print("  Third party            : " + str(third_party))
-print("  Not found in any acct  : " + str(len(unmatched)))
-print("  Report saved           : " + OUT_FILE)
+print("  Total hostnames  : " + str(len(hostnames)))
+print("  Matched          : " + str(len(matched)))
+print("    via API Gateway: " + str(apigw_rows))
+print("    via CloudFront : " + str(cf_rows))
+print("  WAF protected    : " + str(protected))
+print("  Found - NO WAF   : " + str(no_waf))
+print("  Not found        : " + str(len(unmatched)))
+print("  Report saved     : " + OUT_FILE)
 print("=" * 60)
