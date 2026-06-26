@@ -1,0 +1,66 @@
+{
+  "Description": "Add these two rules to the Web ACL on your CloudFront distribution. Rule 1 must run before Rule 2.",
+
+  "Rules": [
+
+    {
+      "Name": "AkamaiXFFHandling",
+      "Priority": 0,
+      "Comment": "MUST run first. Reads the real client IP from X-Forwarded-For when Akamai proxies the request. Without this Bot Control only sees Akamai IP not the real user IP.",
+      "Action": {
+        "Count": {}
+      },
+      "Statement": {
+        "RateBasedStatement": {
+          "Limit": 2000,
+          "AggregateKeyType": "FORWARDED_IP",
+          "ForwardedIPConfig": {
+            "HeaderName": "X-Forwarded-For",
+            "FallbackBehavior": "NO_MATCH"
+          }
+        }
+      },
+      "VisibilityConfig": {
+        "SampledRequestsEnabled": true,
+        "CloudWatchMetricsEnabled": true,
+        "MetricName": "AkamaiXFFHandling"
+      }
+    },
+
+    {
+      "Name": "BotControlRuleGroup",
+      "Priority": 1,
+      "Comment": "Bot Control runs AFTER Rule 1. Set to Count mode first to monitor before enabling block.",
+      "OverrideAction": {
+        "Count": {}
+      },
+      "Statement": {
+        "ManagedRuleGroupStatement": {
+          "VendorName": "AWS",
+          "Name": "AWSManagedRulesBotControlRuleSet",
+          "ManagedRuleGroupConfigs": [
+            {
+              "AWSManagedRulesBotControlRuleSet": {
+                "InspectionLevel": "COMMON",
+                "EnableMachineLearning": true
+              }
+            }
+          ]
+        }
+      },
+      "VisibilityConfig": {
+        "SampledRequestsEnabled": true,
+        "CloudWatchMetricsEnabled": true,
+        "MetricName": "BotControlRuleGroup"
+      }
+    }
+
+  ],
+
+  "AfterTesting": {
+    "Comment": "Once both rules are confirmed working in Count mode, change OverrideAction on BotControlRuleGroup from Count to None to enable blocking.",
+    "BotControlRuleGroup_OverrideAction_change_to": {
+      "None": {}
+    }
+  }
+}
